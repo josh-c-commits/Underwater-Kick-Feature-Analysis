@@ -1,0 +1,25 @@
+[project]
+name = "swim-project"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "matplotlib>=3.9.4",
+    "mediapipe>=1.0.1",
+    "opencv-python>=5.0.0.93",
+    "pandas>=2.3.3",
+    "scikit-optimize>=0.10.2",
+    "scipy>=1.13.1",
+    "ultralytics>=8.4.123",
+]
+
+[project.scripts]
+swim-project = "swim_project:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+package = false
