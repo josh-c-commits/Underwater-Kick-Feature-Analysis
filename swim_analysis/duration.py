@@ -1,10 +1,9 @@
 """Shared duration-window resolution.
 
 Turns either a frame range or a time range (+ fps) into a concrete
-(start_frame, end_frame) pair. Used by both ranking.py (landmark
-tables) and outline.py (outline-derived tables) so both accept the
-same --start-frame/--end-frame/--start-time/--end-time/--fps flags
-with identical behavior.
+(start_frame, end_frame) pair, so every command that takes a duration
+window accepts the same --start-frame/--end-frame/--start-time/
+--end-time/--fps flags with identical behavior.
 """
 
 from __future__ import annotations

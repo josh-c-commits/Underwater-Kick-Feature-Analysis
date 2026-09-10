@@ -9,9 +9,6 @@ dependencies = [
     "mediapipe>=1.0.1",
     "opencv-python>=5.0.0.93",
     "pandas>=2.3.3",
-    "scikit-optimize>=0.10.2",
-    "scipy>=1.13.1",
-    "ultralytics>=8.4.123",
 ]
 
 [project.scripts]
@@ -23,3 +20,14 @@ build-backend = "uv_build"
 
 [tool.uv]
 package = false
+
+[tool.pytest.ini_options]
+# the project isn't installed into the venv (package = false above), so the
+# repo root has to be on sys.path for `import swim_analysis` to resolve
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+]

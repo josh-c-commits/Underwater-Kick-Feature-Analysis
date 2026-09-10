@@ -4,10 +4,9 @@ rank_by_visibility: average each landmark's visibility over a
 duration (frame range or time range) and return landmarks sorted by
 that average, most visible first.
 
-(The old rank_by_max_x -- ranking landmarks by raw x-position -- was
-replaced by outline.outline_rightmost_x_series, which measures the
-SAM2 outline's rightmost pixel directly instead of relying on
-MediaPipe landmark positions.)
+Mainly used to decide which landmarks are worth analyzing at all --
+one that's never visible from a given camera angle shouldn't be
+carried into downstream metrics or scored against ground truth.
 """
 
 from __future__ import annotations
