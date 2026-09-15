@@ -42,13 +42,48 @@ DEFAULT_VISIBILITY_THRESHOLD = 0.5
 
 FIELDS = ("x", "y", "z", "visibility")
 
+# MediaPipe also returns pose_world_landmarks: the same 33 points in metres
+# with the origin at the midpoint of the hips. Unlike the image-space columns
+# these carry no absolute position (so they can't give velocity), but they are
+# metric and independent of how the frame was cropped, which makes them the
+# right source for joint angles -- a 2D angle is corrupted by foreshortening
+# whenever a limb points toward the camera.
+WORLD_FIELDS = ("wx", "wy", "wz")
 
-def named_header() -> List[str]:
-    """Header row using landmark names: left_shoulder_x, left_shoulder_y, ..."""
+# Written alongside the landmarks when extraction runs on a crop, so full-frame
+# position stays recoverable and the crop remains auditable after the fact.
+BOX_FIELDS = ("box_x", "box_y", "box_w", "box_h")
+
+
+def named_header(world: bool = False, box: bool = False) -> List[str]:
+    """Header row using landmark names: left_shoulder_x, left_shoulder_y, ...
+
+    Landmark x/y are always stored in FULL-FRAME normalized coordinates, even
+    when detection ran on a crop -- the crop is an implementation detail of
+    getting MediaPipe to see a big enough subject, and letting it leak into the
+    stored coordinates would silently break every consumer that assumes
+    x * frame_width gives a pixel position.
+    """
     header = ["frame"]
+    if box:
+        header += list(BOX_FIELDS)
     for name in LANDMARK_NAMES:
         header += [f"{name}_{f}" for f in FIELDS]
+    if world:
+        for name in LANDMARK_NAMES:
+            header += [f"{name}_{f}" for f in WORLD_FIELDS]
     return header
+
+
+def world_columns(index: int, style: str = "named") -> Tuple[str, str, str]:
+    """(wx_col, wy_col, wz_col) for a landmark index."""
+    if style == "named":
+        key = LANDMARK_NAMES[index]
+    elif style == "numbered":
+        key = str(index)
+    else:
+        raise ValueError(f"Unknown column style: {style!r}")
+    return tuple(f"{key}_{f}" for f in WORLD_FIELDS)  # type: ignore[return-value]
 
 
 def numbered_header() -> List[str]:

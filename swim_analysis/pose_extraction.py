@@ -14,12 +14,16 @@ import shutil
 import subprocess
 import tempfile
 
+from typing import Optional, Tuple
+
 import cv2
 import mediapipe as mp
+import pandas as pd
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
 from .landmarks import named_header, NUM_LANDMARKS
+from .tracking import crop_to_frame_norm, fixed_box
 
 
 def normalize_video(input_path: str, output_path: str) -> None:
@@ -47,6 +51,55 @@ def normalize_video(input_path: str, output_path: str) -> None:
         raise RuntimeError(f"ffmpeg normalization failed:\n{result.stderr}")
 
 
+def build_row(
+    frame_number: int,
+    pose_landmarks,
+    world_landmarks,
+    box: Optional[Tuple[int, int, int, int]],
+    frame_width: int,
+    frame_height: int,
+    include_world: bool,
+) -> list:
+    """
+    Assemble one CSV row, converting crop-relative landmark coordinates
+    back to full-frame normalized coordinates.
+
+    Split out from the extraction loop purely so the coordinate handling is
+    testable without running MediaPipe -- getting the resituation wrong would
+    silently place every landmark in the wrong part of the frame, which is
+    exactly the kind of bug that doesn't announce itself.
+    """
+    row: list = [frame_number]
+    if box is not None:
+        row += [box[0], box[1], box[2], box[3]]
+
+    if not pose_landmarks:
+        row += [""] * (NUM_LANDMARKS * 4)
+        if include_world:
+            row += [""] * (NUM_LANDMARKS * 3)
+        return row
+
+    for landmark in pose_landmarks:
+        if box is None:
+            x, y = landmark.x, landmark.y
+        else:
+            x, y = crop_to_frame_norm(landmark.x, landmark.y, box, frame_width, frame_height)
+        row += [
+            f"{x:.8f}",
+            f"{y:.8f}",
+            f"{landmark.z:.8f}",
+            f"{landmark.visibility:.8f}",
+        ]
+
+    if include_world:
+        if world_landmarks:
+            for landmark in world_landmarks:
+                row += [f"{landmark.x:.8f}", f"{landmark.y:.8f}", f"{landmark.z:.8f}"]
+        else:
+            row += [""] * (NUM_LANDMARKS * 3)
+    return row
+
+
 def extract(
     input_video: str,
     csv_path: str,
@@ -57,8 +110,25 @@ def extract(
     min_tracking_confidence: float = 0.6,
     normalize: bool = True,
     use_cpu: bool = True,
+    boxes_csv: Optional[str] = None,
+    crop_size: Optional[Tuple[int, int]] = None,
+    include_world: bool = True,
 ) -> None:
-    """Run pose detection on input_video and write results to csv_path."""
+    """
+    Run pose detection on input_video and write results to csv_path.
+
+    boxes_csv: output of `track`. When given, each frame is cropped to a
+    fixed-size window around the tracked centroid before detection, and the
+    resulting landmarks are converted back to full-frame coordinates. This is
+    what makes MediaPipe viable here at all: the swimmer is ~0.3% of the frame,
+    and MediaPipe's person detector sees the whole frame downscaled to a few
+    hundred pixels, so uncropped the subject is only a handful of pixels wide
+    and detection never fires.
+
+    crop_size: (width, height) of that window, fixed for the whole clip so
+    landmark coordinates stay comparable frame to frame. Defaults to a
+    generous multiple of the median tracked box.
+    """
     tmp_dir = None
     try:
         if normalize:
@@ -101,11 +171,28 @@ def extract(
             output_segmentation_masks=False,
         )
 
-        empty_fields = [""] * (NUM_LANDMARKS * 4)
+        frame_width = int(vid_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_height = int(vid_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        boxes = None
+        if boxes_csv is not None:
+            boxes = pd.read_csv(boxes_csv).set_index("frame")
+            if crop_size is None:
+                found = boxes[boxes["found"]]
+                if found.empty:
+                    raise RuntimeError(f"{boxes_csv} has no tracked frames to crop around.")
+                # Pad generously around the median tracked box: limbs leave the
+                # tight detection box during a kick, and a crop that clips them
+                # costs exactly the landmarks the analysis is about.
+                crop_size = (
+                    int(min(frame_width, found["box_w"].median() * 3)),
+                    int(min(frame_height, found["box_h"].median() * 3)),
+                )
+            print(f"Cropping to {crop_size[0]}x{crop_size[1]} around the tracked centroid.")
 
         with open(csv_path, "w", newline="") as csv_file:
             writer = csv.writer(csv_file)
-            writer.writerow(named_header())
+            writer.writerow(named_header(world=include_world, box=boxes is not None))
 
             with vision.PoseLandmarker.create_from_options(options) as landmarker:
                 frame_count = 0
@@ -115,21 +202,40 @@ def extract(
                         break
                     frame_count += 1
 
-                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    box = None
+                    if boxes is not None:
+                        if frame_count not in boxes.index or not bool(
+                            boxes.loc[frame_count, "found"]
+                        ):
+                            writer.writerow(
+                                build_row(frame_count, None, None, (0, 0, 0, 0),
+                                          frame_width, frame_height, include_world)
+                            )
+                            continue
+                        row_data = boxes.loc[frame_count]
+                        box = fixed_box(
+                            float(row_data["centroid_x"]), float(row_data["centroid_y"]),
+                            crop_size[0], crop_size[1], frame_width, frame_height,
+                        )
+                        region = frame[box[1]:box[1] + box[3], box[0]:box[0] + box[2]]
+                    else:
+                        region = frame
+
+                    rgb_frame = cv2.cvtColor(region, cv2.COLOR_BGR2RGB)
                     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
                     timestamp_ms = int((frame_count / fps) * 1000)
                     result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
-                    row = [frame_count]
-                    if result.pose_landmarks:
-                        for lm in result.pose_landmarks[0]:
-                            row.extend([
-                                f"{lm.x:.8f}", f"{lm.y:.8f}",
-                                f"{lm.z:.8f}", f"{lm.visibility:.8f}",
-                            ])
-                    else:
-                        row.extend(empty_fields)
-                    writer.writerow(row)
+                    landmarks = result.pose_landmarks[0] if result.pose_landmarks else None
+                    world = (
+                        result.pose_world_landmarks[0]
+                        if include_world and result.pose_world_landmarks
+                        else None
+                    )
+                    writer.writerow(
+                        build_row(frame_count, landmarks, world, box,
+                                  frame_width, frame_height, include_world)
+                    )
 
         vid_capture.release()
     finally:
