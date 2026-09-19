@@ -13,8 +13,21 @@ Typical pipeline:
 from __future__ import annotations
 
 import argparse
+import os
 
 from .landmarks import DEFAULT_VISIBILITY_THRESHOLD, LANDMARK_NAMES
+
+
+def _ensure_parent(path: str) -> str:
+    """Create the directory an output file is about to be written into.
+
+    Called before the work starts, not after: tracking a long clip and then
+    failing on a missing directory throws away minutes of computation for a
+    reason that was knowable up front.
+    """
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    return path
 
 
 def _add_duration_args(parser: argparse.ArgumentParser) -> None:
@@ -72,6 +85,10 @@ def build_parser() -> argparse.ArgumentParser:
                           help="search the whole frame instead of auto-detecting a band")
     p_track.add_argument("--sigma", type=float, default=6.0,
                           help="detection threshold in robust deviations above the ROI median")
+    p_track.add_argument("--max-samples", type=int, default=120,
+                          help="frames median-composited into the background plate. All are "
+                               "held in RAM at once, so ~120 is fine for small clips but 1080p "
+                               "wants 40-60 (120 frames of 1920x1080 is ~750MB).")
     p_track.add_argument("--min-area", type=int, default=80)
     p_track.add_argument("--max-jump", type=float, default=60.0)
     p_track.add_argument("--preview", default=None, metavar="OUT_VIDEO",
@@ -173,11 +190,15 @@ def _run_track(args) -> None:
     from .frames import median_background
     from .tracking import contact_sheet, detect_boxes, draw_preview, suggest_roi
 
+    for path in (args.out_csv, args.preview, args.sheet):
+        if path:
+            _ensure_parent(path)
+
     roi = tuple(args.roi) if args.roi else None
-    background = median_background(args.input_video)
+    background = median_background(args.input_video, max_samples=args.max_samples)
 
     if roi is None and not args.no_auto_roi:
-        roi = suggest_roi(args.input_video)
+        roi = suggest_roi(args.input_video, max_samples=min(args.max_samples, 60))
         print(f"Auto-detected search band: rows {roi[0]}-{roi[1]}")
 
     seed = tuple(args.seed) if args.seed else None
@@ -212,6 +233,7 @@ def _run_calibrate(args) -> None:
     from .frames import frame_size, median_background
     from .pointpicker import label_keypoints
 
+    _ensure_parent(args.out_json)
     print(f"Building a median reference image from {args.max_samples} frames...")
     reference = median_background(args.input_video, max_samples=args.max_samples)
     names = [f"{mark:g}m" for mark in args.marks]
@@ -258,6 +280,7 @@ def _run_label(args) -> None:
     from .pointpicker import label_keypoints
     from .tracking import fixed_box
 
+    _ensure_parent(args.out_csv)
     if (args.frames is None) == (args.sample is None):
         raise SystemExit("Provide exactly one of --frames or --sample.")
 
@@ -322,6 +345,7 @@ def _run_analyze(args) -> None:
     from .analysis import kinematics, summarize
     from .frames import fps as video_fps
 
+    _ensure_parent(args.out_csv)
     if args.fps is None and args.video is None:
         raise SystemExit("Provide --fps or --video so the frame rate is known.")
     fps = args.fps if args.fps is not None else video_fps(args.video)
@@ -352,6 +376,7 @@ def _run_body_length(args) -> None:
 
     from .analysis import body_length_series
 
+    _ensure_parent(args.out_png)
     table = pd.read_csv(args.csv_path)
     lengths = body_length_series(table, chain=args.chain)
     finite = np.isfinite(lengths)
@@ -387,6 +412,7 @@ def main(argv=None) -> None:
 
     if args.command == "normalize-video":
         from .pose_extraction import normalize_video
+        _ensure_parent(args.output_video)
         normalize_video(args.input_video, args.output_video)
         print(f"Normalized video saved to: {args.output_video}")
         print("Use this exact file for every later stage so frame numbering stays consistent.")
@@ -408,6 +434,7 @@ def main(argv=None) -> None:
 
     elif args.command == "extract":
         from .pose_extraction import extract
+        _ensure_parent(args.csv_path)
         extract(
             args.input_video,
             args.csv_path,
@@ -421,6 +448,7 @@ def main(argv=None) -> None:
 
     elif args.command == "annotate":
         from .annotate import annotate
+        _ensure_parent(args.output_video)
         annotate(
             args.input_video,
             args.csv_path,

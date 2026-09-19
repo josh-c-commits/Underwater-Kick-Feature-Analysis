@@ -20,5 +20,13 @@ runs/
 *.mov
 *.mp4
 
+# Derived per-clip artifacts (boxes, kinematics, contact sheets): all
+# reproducible from data/ plus a calibration, so not worth versioning.
+out/
+
+# NOT ignored: data/calibrations/*.json. Those are hand-clicked reference
+# marks -- small, slow to recreate, and genuinely input rather than output.
+!data/calibrations/
+
 # macOS
 .DS_Store
