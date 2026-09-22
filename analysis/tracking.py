@@ -97,6 +97,59 @@ def crop_to_frame_norm(
     )
 
 
+def estimate_translation(
+    frame_gray: np.ndarray, reference_gray: np.ndarray
+) -> Tuple[float, float, float]:
+    """
+    (dx, dy, response): the sub-pixel shift mapping `reference_gray` onto
+    `frame_gray`, by phase correlation.
+
+    Phase correlation compares the two images in the frequency domain, where a
+    spatial shift is a phase ramp, so the answer falls out as the location of a
+    single correlation peak. That makes it both fast and largely indifferent to
+    brightness changes -- useful underwater, where light flickers constantly.
+
+    It only recovers translation. Rotation or zoom will not be corrected and
+    will instead show up as a weak `response`, which is the caller's cue that
+    the estimate should not be trusted.
+    """
+    shift, response = cv2.phaseCorrelate(
+        np.float32(reference_gray), np.float32(frame_gray)
+    )
+    return float(shift[0]), float(shift[1]), float(response)
+
+
+def shift_image(image: np.ndarray, dx: float, dy: float) -> np.ndarray:
+    """Translate an image by a (sub-pixel) offset, leaving vacated edges black."""
+    matrix = np.float32([[1.0, 0.0, dx], [0.0, 1.0, dy]])
+    return cv2.warpAffine(image, matrix, (image.shape[1], image.shape[0]))
+
+
+def _blank_border(diff: np.ndarray, dx: float, dy: float) -> np.ndarray:
+    """
+    Zero the edge strip that a shift pulled in from outside the image.
+
+    Those pixels have no counterpart in the other image, so their difference is
+    meaningless -- and large. Left alone they form a bright frame-wide border
+    blob that outweighs the swimmer.
+    """
+    height, width = diff.shape[:2]
+    left = int(np.ceil(abs(dx))) if dx > 0 else 0
+    right = int(np.ceil(abs(dx))) if dx < 0 else 0
+    top = int(np.ceil(abs(dy))) if dy > 0 else 0
+    bottom = int(np.ceil(abs(dy))) if dy < 0 else 0
+
+    if left:
+        diff[:, :min(left, width)] = 0
+    if right:
+        diff[:, max(0, width - right):] = 0
+    if top:
+        diff[:min(top, height), :] = 0
+    if bottom:
+        diff[max(0, height - bottom):, :] = 0
+    return diff
+
+
 def _binary_diff(
     frame: np.ndarray,
     background_gray: np.ndarray,
@@ -104,11 +157,39 @@ def _binary_diff(
     blur: int,
     roi: Optional[Tuple[int, int]],
     sigma: float,
+    stabilize: bool = False,
+    min_response: float = 0.02,
+    min_shift: float = 2.5,
 ) -> np.ndarray:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     if blur > 1:
         gray = cv2.GaussianBlur(gray, (blur | 1, blur | 1), 0)
+
+    shift = (0.0, 0.0)
+    if stabilize:
+        dx, dy, response = estimate_translation(gray, background_gray)
+        # Below min_shift, correcting costs more than it fixes: warping
+        # resamples (and so slightly blurs) the plate, and blanking the border
+        # discards usable frame. Surface ripple alone produces a confident but
+        # meaningless sub-pixel estimate, and acting on it measurably worsened
+        # detection on steady footage (94% -> 90% tracked).
+        #
+        # The default separates the two regimes by measurement rather than
+        # taste: on a fixed camera the estimate never exceeded ~2.2px, while
+        # genuinely drifting footage reached 8px at p90 and 62px at worst.
+        # Anything under a couple of pixels is ripple; real movement is larger.
+        if response >= min_response and np.hypot(dx, dy) >= min_shift:
+            # The *plate* is warped onto the frame, never the other way round.
+            # Warping the frame would leave every detection in shifted
+            # coordinates that then have to be undone, and any mistake there
+            # silently biases every position downstream. Moving the reference
+            # instead keeps detections in true frame coordinates throughout.
+            background_gray = shift_image(background_gray, dx, dy)
+            shift = (dx, dy)
+
     diff = cv2.absdiff(gray, background_gray)
+    if shift != (0.0, 0.0):
+        diff = _blank_border(diff, shift[0], shift[1])
 
     # Everything outside the ROI is zeroed *before* thresholding, not filtered
     # out afterwards. On this footage the lane rope sways hard enough to average
@@ -239,6 +320,9 @@ def detect_boxes(
     area_ratio: float = 3.0,
     area_anchor_samples: int = 15,
     max_radius_factor: float = 4.0,
+    stabilize: bool = False,
+    min_response: float = 0.02,
+    min_shift: float = 2.5,
     blur: int = 5,
     max_samples: int = 120,
     progress: bool = True,
@@ -255,6 +339,11 @@ def detect_boxes(
     ripple is being picked up.
     max_jump: how far (px) the centroid may move between frames before
     the match is treated as implausible.
+    stabilize: compensate camera drift by phase-correlating each frame
+    against the background plate before differencing. Background
+    subtraction assumes a fixed camera; without this, a camera that
+    wanders even 25px turns every high-contrast edge in the scene --
+    lane ropes, floor lines, tile borders -- into false motion.
     seed_point: (x, y) on frame 1 identifying *which* swimmer to follow.
     Without it the largest blob wins, which on any footage with more
     than one lane occupied is usually the wrong person -- whoever is
@@ -278,7 +367,9 @@ def detect_boxes(
     coasting = 0
 
     for number, frame in iter_frames(video_path):
-        binary = _binary_diff(frame, background_gray, threshold, blur, roi, sigma)
+        binary = _binary_diff(frame, background_gray, threshold, blur, roi, sigma,
+                              stabilize=stabilize, min_response=min_response,
+                              min_shift=min_shift)
         # Anchored to the first few accepted areas, never a rolling window. A
         # rolling reference drifts: each slightly-larger blob shifts the median,
         # which admits a larger one still, and the gate walks itself onto a

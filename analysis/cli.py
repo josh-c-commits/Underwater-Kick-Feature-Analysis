@@ -89,6 +89,11 @@ def build_parser() -> argparse.ArgumentParser:
                           help="frames median-composited into the background plate. All are "
                                "held in RAM at once, so ~120 is fine for small clips but 1080p "
                                "wants 40-60 (120 frames of 1920x1080 is ~750MB).")
+    p_track.add_argument("--stabilize", action="store_true",
+                          help="compensate camera drift by phase-correlating each frame "
+                               "against the background plate. Use when the camera isn't "
+                               "rigidly mounted. Only corrects translation, not rotation "
+                               "or zoom, and costs ~36ms/frame at 1080p.")
     p_track.add_argument("--min-area", type=int, default=80)
     p_track.add_argument("--max-jump", type=float, default=60.0)
     p_track.add_argument("--preview", default=None, metavar="OUT_VIDEO",
@@ -218,6 +223,7 @@ def _run_track(args) -> None:
     boxes = detect_boxes(
         args.input_video, background=background, roi=roi, seed_point=seed,
         min_area=args.min_area, sigma=args.sigma, max_jump=args.max_jump,
+        stabilize=args.stabilize,
     )
     boxes.to_csv(args.out_csv, index=False)
     print(f"Boxes saved to: {args.out_csv}")
