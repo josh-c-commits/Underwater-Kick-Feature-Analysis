@@ -3,7 +3,7 @@ import math
 import numpy as np
 import pytest
 
-from swim_analysis.calibration import Calibration, ReferenceLine, series_world_x
+from analysis.calibration import Calibration, ReferenceLine, series_world_x
 
 
 def line(name, y, knots):

@@ -1,6 +1,6 @@
 import pytest
 
-from swim_analysis.duration import resolve_frame_bounds
+from analysis.duration import resolve_frame_bounds
 
 
 def test_frame_bounds_pass_through_unchanged():

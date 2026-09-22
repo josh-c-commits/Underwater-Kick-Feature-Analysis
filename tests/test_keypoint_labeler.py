@@ -6,7 +6,7 @@ import pytest
 
 matplotlib.use("Agg")
 
-from swim_analysis.pointpicker import _KeypointLabeler  # noqa: E402
+from analysis.pointpicker import _KeypointLabeler  # noqa: E402
 
 NAMES = ["nose", "left_wrist", "right_wrist"]
 

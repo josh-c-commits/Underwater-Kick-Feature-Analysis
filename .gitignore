@@ -9,13 +9,6 @@ wheels/
 # Virtual environments
 .venv
 
-# ultralytics' default output dir (created by generate-outline even though
-# we don't use its saved visuals -- masks are written to the masks_dir arg)
-runs/
-
-# SAM checkpoints -- these auto-download on first use (see outline_capture.py)
-*.pt
-
 # Source/sample videos and their derived outputs -- local data, not code
 *.mov
 *.mp4

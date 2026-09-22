@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from swim_analysis.frames import (
+from analysis.frames import (
     frame_at,
     frame_count,
     frame_size,

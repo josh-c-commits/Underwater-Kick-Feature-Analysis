@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from swim_analysis.analysis import (
+from analysis.analysis import (
     body_length_series,
     derivative,
     dominant_frequency,
@@ -13,8 +13,8 @@ from swim_analysis.analysis import (
     summarize,
     velocity_fluctuation_index,
 )
-from swim_analysis.calibration import Calibration, ReferenceLine
-from swim_analysis.landmarks import LANDMARK_NAMES, NUM_LANDMARKS, named_header, world_columns
+from analysis.calibration import Calibration, ReferenceLine
+from analysis.landmarks import LANDMARK_NAMES, NUM_LANDMARKS, named_header, world_columns
 
 FPS = 60.0
 

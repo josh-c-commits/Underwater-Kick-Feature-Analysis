@@ -9,7 +9,7 @@ import pytest
 
 matplotlib.use("Agg")
 
-from swim_analysis.pointpicker import _PointPicker  # noqa: E402
+from analysis.pointpicker import _PointPicker  # noqa: E402
 
 W, H = 1624, 320
 

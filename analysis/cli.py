@@ -1,13 +1,13 @@
-"""Command-line entry point for swim_analysis.
+"""Command-line entry point for analysis.
 
 Typical pipeline:
 
-    python -m swim_analysis normalize-video raw.mov clip.mp4
-    python -m swim_analysis track clip.mp4 boxes.csv --seed X Y --sheet sheet.png
-    python -m swim_analysis calibrate clip.mp4 calib.json --line near_rope --line far_rope \
+    python -m analysis normalize-video raw.mov clip.mp4
+    python -m analysis track clip.mp4 boxes.csv --seed X Y --sheet sheet.png
+    python -m analysis calibrate clip.mp4 calib.json --line near_rope --line far_rope \
         --marks 7.86 15.0
-    python -m swim_analysis analyze boxes.csv kinematics.csv --calibration calib.json
-    python -m swim_analysis extract clip.mp4 poses.csv --model PATH --boxes boxes.csv
+    python -m analysis analyze boxes.csv kinematics.csv --calibration calib.json
+    python -m analysis extract clip.mp4 poses.csv --model PATH --boxes boxes.csv
 """
 
 from __future__ import annotations
@@ -56,7 +56,7 @@ def _validate_duration_args(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="swim_analysis")
+    parser = argparse.ArgumentParser(prog="analysis")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_normalize = sub.add_parser(

@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from swim_analysis.tracking import BOX_COLUMNS, detect_boxes, fixed_box, suggest_roi
+from analysis.tracking import BOX_COLUMNS, detect_boxes, fixed_box, suggest_roi
 
 from conftest import moving_square_frames, write_video
 

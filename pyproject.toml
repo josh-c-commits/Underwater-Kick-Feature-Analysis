@@ -24,7 +24,7 @@ package = false
 
 [tool.pytest.ini_options]
 # the project isn't installed into the venv (package = false above), so the
-# repo root has to be on sys.path for `import swim_analysis` to resolve
+# repo root has to be on sys.path for `import analysis` to resolve
 pythonpath = ["."]
 testpaths = ["tests"]
 

@@ -5,9 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from swim_analysis.landmarks import NUM_LANDMARKS, named_header, world_columns
-from swim_analysis.pose_extraction import build_row
-from swim_analysis.tracking import crop_to_frame_norm
+from analysis.landmarks import NUM_LANDMARKS, named_header, world_columns
+from analysis.pose_extraction import build_row
+from analysis.tracking import crop_to_frame_norm
 
 FRAME_W, FRAME_H = 1624, 320
 

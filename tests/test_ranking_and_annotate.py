@@ -1,9 +1,9 @@
 import pandas as pd
 import pytest
 
-from swim_analysis.annotate import _row_to_points
-from swim_analysis.landmarks import LANDMARK_NAMES, NUM_LANDMARKS, named_header
-from swim_analysis.ranking import rank_by_visibility
+from analysis.annotate import _row_to_points
+from analysis.landmarks import LANDMARK_NAMES, NUM_LANDMARKS, named_header
+from analysis.ranking import rank_by_visibility
 
 
 def _write_csv(path, rows):

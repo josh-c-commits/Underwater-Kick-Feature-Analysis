@@ -1,6 +1,6 @@
 import pytest
 
-from swim_analysis.landmarks import (
+from analysis.landmarks import (
     LANDMARK_NAMES,
     NUM_LANDMARKS,
     POSE_CONNECTIONS,

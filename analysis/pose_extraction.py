@@ -132,7 +132,7 @@ def extract(
     tmp_dir = None
     try:
         if normalize:
-            tmp_dir = tempfile.mkdtemp(prefix="swim_analysis_")
+            tmp_dir = tempfile.mkdtemp(prefix="analysis_")
             video_path = os.path.join(tmp_dir, "normalized_input.mp4")
             normalize_video(input_video, video_path)
         else:
