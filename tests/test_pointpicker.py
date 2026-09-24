@@ -141,3 +141,38 @@ def test_mask_overlay_does_not_change_reported_coordinates():
     p.on_release(event(p, x=10, y=10, xdata=820.0, ydata=175.0))
     assert p.point == (820, 175)
     matplotlib.pyplot.close(p.fig)
+
+
+# ---------- matplotlib default keymap ----------
+
+def _registered_key_handlers(fig):
+    refs = fig.canvas.callbacks.callbacks.get("key_press_event", {})
+    return [ref() for ref in refs.values()]
+
+
+def test_ordinary_figures_do_carry_the_default_keymap():
+    """Control for the test below: proves the check can actually fail."""
+    import matplotlib.pyplot as plt
+    from matplotlib.backend_bases import key_press_handler
+
+    fig, _ = plt.subplots()
+    try:
+        assert key_press_handler in _registered_key_handlers(fig)
+    finally:
+        plt.close(fig)
+
+
+def test_picker_detaches_the_default_keymap():
+    """Matplotlib binds 's' to save-figure and 'p' to pan mode by default,
+    which hijacked the labeller's skip and previous keys."""
+    import matplotlib.pyplot as plt
+    from matplotlib.backend_bases import key_press_handler
+
+    from analysis.pointpicker import _KeypointLabeler
+
+    img = np.zeros((50, 80, 3), dtype=np.uint8)
+    for view in (_PointPicker(img), _KeypointLabeler(img, ["a", "b"])):
+        try:
+            assert key_press_handler not in _registered_key_handlers(view.fig)
+        finally:
+            plt.close(view.fig)

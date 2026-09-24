@@ -114,6 +114,44 @@ def dominant_frequency(
     return float(freqs[band][int(np.argmax(spectrum[band]))])
 
 
+def camera_path(boxes: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Per-frame camera offset (dx, dy) from the background plate, as arrays to
+    subtract from frame coordinates to get pool-fixed (plate) coordinates.
+
+    Zero when the table has no camera columns (older runs, or tracking without
+    --stabilize, where the camera is taken to be fixed). Frames whose estimate
+    was too weak to trust are NaN in the table and are interpolated from their
+    neighbours here: the camera was somewhere on those frames, and its path is
+    far smoother than any single noisy estimate of it.
+    """
+    count = len(boxes)
+    if "cam_dx" not in boxes.columns or "cam_dy" not in boxes.columns:
+        return np.zeros(count), np.zeros(count)
+
+    def fill(column: str) -> np.ndarray:
+        series = pd.Series(boxes[column].to_numpy(dtype=float))
+        return series.interpolate(limit_direction="both").fillna(0.0).to_numpy()
+
+    return fill("cam_dx"), fill("cam_dy")
+
+
+def direction_of_travel(x_positions: Sequence[float]) -> int:
+    """
+    +1 if the swimmer moves toward increasing image x, -1 if decreasing,
+    0 if there's too little data to say. Uses a fitted slope over every
+    tracked frame rather than first-vs-last position, so a noisy frame at
+    either end can't flip the answer.
+    """
+    array = np.asarray(x_positions, dtype=float)
+    index = np.arange(array.size, dtype=float)
+    mask = np.isfinite(array)
+    if mask.sum() < 2:
+        return 0
+    slope = np.polyfit(index[mask], array[mask], 1)[0]
+    return int(np.sign(slope))
+
+
 def body_length_series(landmarks: pd.DataFrame, chain: Optional[Sequence[str]] = None) -> np.ndarray:
     """
     Per-frame body length in metres, summed along a chain of world landmarks.
@@ -155,20 +193,39 @@ def kinematics(
     """
     Per-frame position and speed from a tracking table.
 
-    Returns image-space results always, and world-space (metres) columns when a
-    calibration is supplied. Position comes from the blob centroid rather than
-    any single landmark: it's a far more stable centre-of-mass proxy than a
-    wrist or ankle, and it needs no pose model at all.
+    centroid_x/centroid_y are copied through in raw *frame* coordinates -- where
+    the swimmer appeared in the image. Everything derived (the smoothed
+    positions, speeds, world distances) is in *plate* coordinates instead:
+    frame coordinates minus the camera's offset. On a fixed camera the two are
+    identical. On a drifting one, frame coordinates contain the camera's motion
+    as well as the swimmer's, so measuring speed or mapping to metres from them
+    would silently add the drift to the result -- and the calibration was built
+    on the plate, so plate coordinates are the only ones it maps correctly.
+
+    Position comes from the blob centroid rather than any single landmark: it's
+    a far more stable centre-of-mass proxy than a wrist or ankle. When the table
+    has edge columns, the leading edge is added too -- whichever edge faces the
+    direction of travel.
     """
     result = pd.DataFrame({"frame": boxes["frame"].to_numpy()})
     x = boxes["centroid_x"].to_numpy(dtype=float)
     y = boxes["centroid_y"].to_numpy(dtype=float)
+    cam_dx, cam_dy = camera_path(boxes)
 
     result["centroid_x"] = x
     result["centroid_y"] = y
-    result["x_smooth"] = smooth(x, smooth_window)
-    result["y_smooth"] = smooth(y, smooth_window)
+    if "cam_dx" in boxes.columns:
+        result["cam_dx"] = cam_dx
+        result["cam_dy"] = cam_dy
+    result["x_smooth"] = smooth(x - cam_dx, smooth_window)
+    result["y_smooth"] = smooth(y - cam_dy, smooth_window)
     result["speed_px_s"] = derivative(result["x_smooth"], fps)
+
+    direction = direction_of_travel(result["x_smooth"])
+    has_edges = {"edge_left", "edge_right"} <= set(boxes.columns)
+    if has_edges and direction != 0:
+        edge = boxes["edge_right" if direction > 0 else "edge_left"].to_numpy(dtype=float)
+        result["lead_x_smooth"] = smooth(edge - cam_dx, smooth_window)
 
     if calibration is not None:
         from .calibration import series_world_x
@@ -180,13 +237,22 @@ def kinematics(
             calibration.depth_ambiguity(float(v)) if np.isfinite(v) else np.nan
             for v in result["x_smooth"]
         ]
+        if "lead_x_smooth" in result.columns:
+            result["lead_world_x_m"] = series_world_x(
+                calibration, result["lead_x_smooth"], result["y_smooth"]
+            )
     return result
 
 
 def summarize(kinematics_table: pd.DataFrame, fps: float) -> dict:
     """Headline numbers for one swim."""
     speed_column = "speed_m_s" if "speed_m_s" in kinematics_table else "speed_px_s"
-    speed = kinematics_table[speed_column].to_numpy(dtype=float)
+    direction = direction_of_travel(kinematics_table["x_smooth"])
+    # Speed is signed by image direction, so a swimmer going right-to-left has
+    # negative speeds -- and max() of those is their *slowest* moment, not
+    # their fastest. Flipping to "speed in the direction of travel" first keeps
+    # mean and peak meaning the same thing whichever way the swimmer goes.
+    speed = kinematics_table[speed_column].to_numpy(dtype=float) * (direction or 1)
     vertical = kinematics_table["y_smooth"].to_numpy(dtype=float)
 
     finite = speed[np.isfinite(speed)]
@@ -197,6 +263,7 @@ def summarize(kinematics_table: pd.DataFrame, fps: float) -> dict:
         "frames": int(len(kinematics_table)),
         "tracked_frames": int(np.isfinite(kinematics_table["centroid_x"]).sum()),
         "speed_units": "m/s" if speed_column == "speed_m_s" else "px/s",
+        "direction": {1: "left-to-right", -1: "right-to-left"}.get(direction, "unknown"),
         "mean_speed": mean_speed,
         "peak_speed": float(np.max(finite)) if finite.size else float("nan"),
         "velocity_fluctuation_index": velocity_fluctuation_index(speed),

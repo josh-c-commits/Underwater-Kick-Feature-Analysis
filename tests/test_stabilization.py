@@ -134,3 +134,144 @@ def test_low_response_estimates_are_ignored(tmp_path):
     gated = detect_boxes(path, stabilize=True, min_response=1.1, progress=False)
     plain = detect_boxes(path, progress=False)
     assert gated["found"].tolist() == plain["found"].tolist()
+
+
+# ---------- drift must not leak into measured motion ----------
+
+def test_camera_offset_is_recorded_every_frame(tmp_path):
+    path = drifting_video(tmp_path)
+    table = detect_boxes(path, stabilize=True, seed_point=(50, 100), progress=False)
+    # recorded on lost frames too -- the camera moved regardless
+    assert table["cam_dx"].notna().mean() > 0.8
+    # camera drifts +1.5 px/frame; the plate is the median, so offsets are
+    # relative to mid-clip, but their slope must be the drift rate
+    frames = table["frame"].to_numpy(float)
+    ok = table["cam_dx"].notna().to_numpy()
+    slope = np.polyfit(frames[ok], table["cam_dx"].to_numpy(float)[ok], 1)[0]
+    assert slope == pytest.approx(1.5, abs=0.25)
+
+
+def test_camera_drift_is_removed_from_measured_speed(tmp_path):
+    from analysis.analysis import kinematics
+
+    path = drifting_video(tmp_path)  # scene motion +5 px/frame, camera +1.5 px/frame
+    table = detect_boxes(path, stabilize=True, seed_point=(50, 100), progress=False)
+    kin = kinematics(table, fps=30.0)
+    found = table["found"].to_numpy()
+
+    frame_speed = np.nanmedian(np.diff(table["centroid_x"].to_numpy(float)))
+    pool_speed = np.nanmedian(kin["speed_px_s"].to_numpy(float)[found]) / 30.0
+
+    assert frame_speed == pytest.approx(6.5, abs=0.6), "raw detections include the camera"
+    assert pool_speed == pytest.approx(5.0, abs=0.6), "derived speed must not"
+
+
+def test_without_stabilization_the_camera_is_taken_as_fixed(moving_square_video):
+    table = detect_boxes(moving_square_video, progress=False)
+    assert (table["cam_dx"] == 0).all() and (table["cam_dy"] == 0).all()
+
+
+# ---------- deciding whether the camera moved at all ----------
+
+from analysis.tracking import camera_moved, fuse_camera_path, stabilized_background  # noqa: E402
+
+
+def test_ripple_level_noise_is_not_camera_motion():
+    rng = np.random.default_rng(0)
+    noise = rng.normal(0, 0.6, (600, 2))  # still camera: ~0.6px median, like real footage
+    assert not camera_moved(noise)
+
+
+def test_a_single_spike_does_not_switch_stabilization_on():
+    offsets = np.zeros((600, 2))
+    offsets[300] = (9.0, 0.0)
+    assert not camera_moved(offsets)
+
+
+def test_a_short_real_bump_does():
+    offsets = np.zeros((600, 2))
+    offsets[300:310] = (9.0, 0.0)
+    assert camera_moved(offsets)
+
+
+def test_steady_drift_does():
+    ramp = np.stack([np.linspace(0, 40, 600), np.zeros(600)], axis=1)
+    assert camera_moved(ramp)
+
+
+# ---------- the complementary filter ----------
+
+def test_fusion_removes_the_relative_paths_accumulated_drift():
+    n = 300
+    truth = np.stack([np.linspace(0, 30, n), np.zeros(n)], axis=1)
+    relative = truth + np.stack([np.linspace(0, 8, n), np.zeros(n)], axis=1)  # wanders 8px
+    rng = np.random.default_rng(1)
+    absolute = truth + rng.normal(0, 0.5, (n, 2))  # anchored but noisy
+    fused = fuse_camera_path(relative, absolute)
+    assert np.abs(fused - truth)[30:-30].max() < 1.0
+
+
+def test_fusion_ignores_an_absolute_measurement_that_scatters():
+    # a featureless plate gives garbage "absolute" readings; they must not be
+    # allowed to drag the path around (ungated, this was off by 2500px)
+    n = 300
+    relative = np.stack([np.linspace(0, 30, n), np.zeros(n)], axis=1)
+    rng = np.random.default_rng(2)
+    garbage = rng.uniform(-500, 500, (n, 2))
+    fused = fuse_camera_path(relative, garbage)
+    assert np.allclose(fused - fused[0], relative - relative[0], atol=1e-9)
+
+
+def test_stabilizing_a_still_textureless_clip_is_an_exact_no_op(moving_square_video):
+    plate, offsets = stabilized_background(moving_square_video, max_samples=40)
+    assert (offsets == 0).all()
+    plain = detect_boxes(moving_square_video, progress=False)
+    stabilized = detect_boxes(moving_square_video, stabilize=True, progress=False)
+    assert plain["found"].tolist() == stabilized["found"].tolist()
+
+
+def test_passing_a_plate_with_stabilize_is_rejected(moving_square_video):
+    from analysis.frames import median_background
+
+    with pytest.raises(ValueError, match="background=None"):
+        detect_boxes(moving_square_video, stabilize=True,
+                     background=median_background(moving_square_video), progress=False)
+
+
+# ---------- calibration reference from part of a drifting clip ----------
+
+from analysis.tracking import calibration_reference, plate_offset  # noqa: E402
+
+
+def test_marker_frames_land_in_the_tracking_plates_coordinates(tmp_path):
+    """Markers down for frames 1-10 of a drifting clip: the reference built from
+    just those frames has to line up with the plate tracking measures against,
+    not with where the camera happened to be while the markers were down."""
+    world = cv2.cvtColor(textured(200, 320), cv2.COLOR_GRAY2BGR)
+    frames = []
+    for i in range(40):
+        scene = world.copy()
+        if i < 10:
+            scene[90:110, 150:170] = 0  # a marker on the pool floor
+        frames.append(shift_image(scene, i * 1.5, i * 0.6))
+    path = write_video(tmp_path / "markers_drift.mp4", frames)
+
+    reference, plate = calibration_reference(path, frames=(1, 10), stabilize=True,
+                                             max_samples=40)
+    # Tracking maps a frame position to the plate as position - offset. A click
+    # on the marker has to give the same answer tracking would for an object
+    # sitting there -- whatever the offsets' own accuracy.
+    _, offsets = stabilized_background(path, max_samples=40)
+    in_frames = np.array([(159.5 + i * 1.5, 99.5 + i * 0.6) for i in range(10)])
+    expected = np.median(in_frames - offsets[:10], axis=0)
+
+    gray = cv2.cvtColor(reference, cv2.COLOR_BGR2GRAY)
+    ys, xs = np.nonzero(gray[40:180, 100:260] < 40)
+    assert xs.mean() + 100 == pytest.approx(expected[0], abs=1.0)
+    assert ys.mean() + 40 == pytest.approx(expected[1], abs=1.0)
+
+    # and without the alignment the marker frames would sit far off the plate:
+    # the camera was up to ~30px from its median position while they were shot
+    assert np.abs(offsets[:10]).max() > 15
+    shift = plate_offset(reference, plate)
+    assert shift is not None and np.hypot(*shift) < 2.0, "calibrate would warn"

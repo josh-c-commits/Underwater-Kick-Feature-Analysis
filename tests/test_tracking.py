@@ -107,3 +107,20 @@ def test_suggest_roi_excludes_a_persistently_noisy_band(tmp_path):
     y0, y1 = suggest_roi(path, max_samples=20)
     assert y0 >= 25, f"noisy band should be excluded, got roi=({y0},{y1})"
     assert y1 > y0
+
+
+# ---------- robust edges ----------
+
+def test_edges_bracket_the_centroid_inside_the_box(moving_square_video):
+    found = detect_boxes(moving_square_video, progress=False).query("found")
+    assert (found["edge_left"] < found["centroid_x"]).all()
+    assert (found["centroid_x"] < found["edge_right"]).all()
+    assert (found["edge_left"] >= found["box_x"]).all()
+    assert (found["edge_right"] <= found["box_x"] + found["box_w"]).all()
+
+
+def test_edges_track_a_solid_target_closely(moving_square_video):
+    # a solid 24px square: the 98th-percentile column sits within ~1px of its side
+    found = detect_boxes(moving_square_video, progress=False).query("found")
+    right_side = found["box_x"] + found["box_w"] - 1
+    assert (right_side - found["edge_right"]).abs().max() <= 1.5

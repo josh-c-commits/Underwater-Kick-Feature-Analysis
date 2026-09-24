@@ -86,3 +86,19 @@ def test_median_background_keeps_static_structure(tmp_path):
     background = median_background(path, max_samples=30)
     assert background[10:20, :].mean() < 40, "static structure should survive"
     assert background[100:150, :].mean() > 150, "moving object should not"
+
+
+def test_median_background_over_part_of_the_clip(tmp_path):
+    """Markers down for only the first 10 of 40 frames vanish from a whole-clip
+    median, but a median of just those frames keeps them."""
+    frames = []
+    for i in range(40):
+        frame = np.full((120, 160, 3), 200, dtype=np.uint8)
+        if i < 10:
+            frame[50:70, 60:80] = 20
+        frames.append(frame)
+    path = write_video(tmp_path / "markers.mp4", frames)
+
+    assert median_background(path, max_samples=40)[60, 70].mean() > 150
+    assert median_background(path, 40, start_frame=1, end_frame=10)[60, 70].mean() < 60
+    assert median_background(path, 40, start_frame=11)[60, 70].mean() > 150

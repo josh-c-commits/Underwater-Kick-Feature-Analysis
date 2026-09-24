@@ -4,8 +4,7 @@ Typical pipeline:
 
     python -m analysis normalize-video raw.mov clip.mp4
     python -m analysis track clip.mp4 boxes.csv --seed X Y --sheet sheet.png
-    python -m analysis calibrate clip.mp4 calib.json --line near_rope --line far_rope \
-        --marks 7.86 15.0
+    python -m analysis calibrate clip.mp4 calib.json --line floor --mark-range 0 15 1
     python -m analysis analyze boxes.csv kinematics.csv --calibration calib.json
     python -m analysis extract clip.mp4 poses.csv --model PATH --boxes boxes.csv
 """
@@ -13,7 +12,9 @@ Typical pipeline:
 from __future__ import annotations
 
 import argparse
+import math
 import os
+from typing import List, Optional, Tuple
 
 from .landmarks import DEFAULT_VISIBILITY_THRESHOLD, LANDMARK_NAMES
 
@@ -55,6 +56,22 @@ def _validate_duration_args(args: argparse.Namespace) -> None:
         raise SystemExit("--fps is required when using --start-time/--end-time.")
 
 
+class _MarkRange(argparse.Action):
+    """--mark-range START STOP STEP: evenly spaced marks, STOP included when a
+    step lands on it. Appends to the same list as --marks, so the two can be
+    mixed and still pair up with --line in command-line order."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        start, stop, step = values
+        if step <= 0 or stop <= start:
+            parser.error(f"{option_string} needs START below STOP and a positive STEP, "
+                         f"got {start:g} {stop:g} {step:g}")
+        count = int(math.floor((stop - start) / step + 1e-9)) + 1
+        # rounded so 0.1 steps give 0.3, not 0.30000000000000004
+        marks = [round(start + i * step, 6) for i in range(count)]
+        setattr(namespace, self.dest, (getattr(namespace, self.dest) or []) + [marks])
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="analysis")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -90,10 +107,13 @@ def build_parser() -> argparse.ArgumentParser:
                                "held in RAM at once, so ~120 is fine for small clips but 1080p "
                                "wants 40-60 (120 frames of 1920x1080 is ~750MB).")
     p_track.add_argument("--stabilize", action="store_true",
-                          help="compensate camera drift by phase-correlating each frame "
-                               "against the background plate. Use when the camera isn't "
-                               "rigidly mounted. Only corrects translation, not rotation "
-                               "or zoom, and costs ~36ms/frame at 1080p.")
+                          help="measure and compensate camera drift, for footage where the "
+                               "camera may not have stayed put. Positions are corrected into "
+                               "fixed pool coordinates. Switches itself off (identical output) "
+                               "when it finds no camera motion beyond water noise. Corrects "
+                               "sliding only, not rotation or zoom; reads the video ~3x, so "
+                               "it's noticeably slower at 1080p. Use the same flag with "
+                               "`calibrate` so both share one reference.")
     p_track.add_argument("--min-area", type=int, default=80)
     p_track.add_argument("--max-jump", type=float, default=60.0)
     p_track.add_argument("--preview", default=None, metavar="OUT_VIDEO",
@@ -108,13 +128,38 @@ def build_parser() -> argparse.ArgumentParser:
     p_calib.add_argument("input_video")
     p_calib.add_argument("out_json")
     p_calib.add_argument("--line", action="append", required=True, metavar="NAME",
-                          help="name of a reference line to click along, e.g. near_rope. "
-                               "Repeat for each; two (the ropes either side of the swimmer) "
-                               "is what makes depth ambiguity measurable.")
-    p_calib.add_argument("--marks", type=float, nargs="+", required=True, metavar="METRES",
-                          help="world distances of the marks you'll click, e.g. 7.86 15.0")
+                          help="name of a line of marks to click along, e.g. floor for "
+                               "markers placed along the swimmer's lane line. Repeat for "
+                               "each line, e.g. a second row of markers at swimmer depth.")
+    p_calib.add_argument("--marks", type=float, nargs="+", action="append", dest="mark_lists",
+                          metavar="METRES",
+                          help="distances from the wall of the marks you'll click, e.g. "
+                               "0 2.5 5 10 15. Give it once for every line to share, or once "
+                               "per --line, in the same order, when lines differ.")
+    p_calib.add_argument("--mark-range", type=float, nargs=3, action=_MarkRange,
+                          dest="mark_lists", metavar=("START", "STOP", "STEP"),
+                          help="evenly spaced marks, e.g. 0 15 1 for a marker every metre "
+                               "out to 15m. Counts as one --marks list.")
+    when = p_calib.add_mutually_exclusive_group()
+    when.add_argument("--frames", type=int, nargs=2, metavar=("FIRST", "LAST"),
+                      help="build the reference image from only these frames (1-indexed, "
+                           "inclusive): when the markers were down, if they came out before "
+                           "the swim. Otherwise the whole clip is used, and markers that "
+                           "were only there briefly vanish from it.")
+    when.add_argument("--seconds", type=float, nargs=2, metavar=("FROM", "TO"),
+                      help="the same as --frames, in seconds from the start of the video")
+    p_calib.add_argument("--edit", action="store_true",
+                          help="reopen the clicks already saved in OUT_JSON, to fix one mark "
+                               "without redoing the rest")
     p_calib.add_argument("--max-samples", type=int, default=120,
                           help="frames to median-composite into the reference image")
+    p_calib.add_argument("--stabilize", action="store_true",
+                          help="build the reference image the same way `track --stabilize` "
+                               "builds its plate. Use it whenever you track with --stabilize: "
+                               "on a moving camera a plain median is smeared and sits in a "
+                               "different position, so clicked marks wouldn't line up with "
+                               "measured positions. With --frames it also corrects for the "
+                               "camera moving between the markers going down and the swim.")
 
     p_label = sub.add_parser(
         "label", help="hand-label keypoints on sampled frames to create ground truth"
@@ -139,6 +184,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_analyze.add_argument("--calibration", default=None,
                             help="calibration json; without it speeds stay in px/s")
     p_analyze.add_argument("--smooth-window", type=int, default=11)
+
+    p_overlay = sub.add_parser(
+        "overlay",
+        help="draw distance lines (and optionally tracking) onto the video to check them",
+    )
+    p_overlay.add_argument("input_video")
+    p_overlay.add_argument("out_video")
+    p_overlay.add_argument("--calibration", default=None,
+                            help="calibration json: draws lines of constant distance along "
+                                 "the pool. Solid where it interpolates between reference "
+                                 "lines, dashed where it's extrapolating -- trust those less.")
+    p_overlay.add_argument("--boxes", default=None,
+                            help="tracking csv: draws box, centroid, leading edge, and the "
+                                 "swimmer's distance when a calibration is also given")
+    p_overlay.add_argument("--every", type=float, default=1.0, metavar="METRES",
+                            help="spacing of the distance lines (every 5m drawn heavier)")
+    p_overlay.add_argument("--still", action="store_true",
+                            help="draw onto the pool's median image (no swimmers, no ripple) "
+                                 "and save a picture instead of a video, with your clicked "
+                                 "marks shown. Rebuilds exactly the image the marks were "
+                                 "clicked on: stabilized or not, from the same --frames. "
+                                 "OUT should be a .png.")
+    p_overlay.add_argument("--max-samples", type=int, default=120,
+                            help="frames median-composited into the still's reference image")
 
     p_bodylen = sub.add_parser(
         "body-length",
@@ -192,16 +261,14 @@ DEFAULT_LABEL_SET = [
 
 
 def _run_track(args) -> None:
-    from .frames import median_background
-    from .tracking import contact_sheet, detect_boxes, draw_preview, suggest_roi
+    from .overlay import draw_overlay
+    from .tracking import contact_sheet, detect_boxes, suggest_roi
 
     for path in (args.out_csv, args.preview, args.sheet):
         if path:
             _ensure_parent(path)
 
     roi = tuple(args.roi) if args.roi else None
-    background = median_background(args.input_video, max_samples=args.max_samples)
-
     if roi is None and not args.no_auto_roi:
         roi = suggest_roi(args.input_video, max_samples=min(args.max_samples, 60))
         print(f"Auto-detected search band: rows {roi[0]}-{roi[1]}")
@@ -221,7 +288,7 @@ def _run_track(args) -> None:
               "with more than one lane occupied is often the wrong swimmer.")
 
     boxes = detect_boxes(
-        args.input_video, background=background, roi=roi, seed_point=seed,
+        args.input_video, roi=roi, seed_point=seed, max_samples=args.max_samples,
         min_area=args.min_area, sigma=args.sigma, max_jump=args.max_jump,
         stabilize=args.stabilize,
     )
@@ -229,41 +296,161 @@ def _run_track(args) -> None:
     print(f"Boxes saved to: {args.out_csv}")
 
     if args.preview:
-        draw_preview(args.input_video, boxes, args.preview)
+        draw_overlay(args.input_video, args.preview, boxes=boxes)
     if args.sheet:
         contact_sheet(args.input_video, boxes, args.sheet, stride=args.sheet_stride)
 
 
+def _mark_lists(args) -> List[List[float]]:
+    """One list of mark distances per --line: a single list is shared by
+    every line, otherwise lists pair with lines in command-line order."""
+    lists = args.mark_lists
+    if not lists:
+        raise SystemExit("Give the distances of the marks you'll click, with --marks "
+                         "(e.g. --marks 0 5 10 15) or --mark-range (e.g. --mark-range 0 15 1).")
+    if len(lists) == 1:
+        lists = lists * len(args.line)
+    elif len(lists) != len(args.line):
+        raise SystemExit(f"{len(lists)} lists of marks for {len(args.line)} --line(s). Give "
+                         "one list for every line to share, or one per line, in order.")
+    for name, marks in zip(args.line, lists):
+        if len(marks) < 2:
+            raise SystemExit(f"{name} needs at least two distances: a single known point "
+                             "can't define a scale.")
+        if len(set(marks)) != len(marks):
+            raise SystemExit(f"{name}'s marks repeat a distance: {marks}")
+    return lists
+
+
+def _frame_range(args) -> Optional[Tuple[int, int]]:
+    """--frames or --seconds as a checked (first, last) frame range, or None."""
+    from .frames import fps, frame_count
+
+    if args.frames is None and args.seconds is None:
+        return None
+    if args.seconds is not None:
+        begin, finish = args.seconds
+        if begin < 0 or finish <= begin:
+            raise SystemExit(f"--seconds needs FROM before TO, got {begin:g} {finish:g}")
+        rate = fps(args.input_video)
+        first = int(math.floor(begin * rate)) + 1
+        last = max(first, int(math.ceil(finish * rate)))
+    else:
+        first, last = args.frames
+        if first < 1 or last < first:
+            raise SystemExit(f"--frames needs 1 <= FIRST <= LAST, got {first} {last} "
+                             "(frames count from 1)")
+    total = frame_count(args.input_video)
+    if total > 0 and first > total:
+        raise SystemExit(f"{args.input_video} has only {total} frames.")
+    if total > 0 and last > total:
+        print(f"The video ends at frame {total}, so using frames {first}-{total}.")
+        last = total
+    return first, last
+
+
+def _check_calibration_frames(args, reference, plate, frames) -> None:
+    """Warn if the reference from `frames` doesn't sit where tracking's plate does."""
+    from .frames import median_background
+    from .tracking import plate_offset
+
+    if plate is None:
+        print("Building the plate tracking will use, to check the camera didn't move...")
+        plate = median_background(args.input_video, max_samples=args.max_samples)
+    shift = plate_offset(reference, plate)
+    span = f"frames {frames[0]}-{frames[1]}"
+    if shift is None:
+        if args.stabilize:
+            print(f"Warning: couldn't line {span} up with the stabilized plate. Stabilization "
+                  "may have gone wrong on this clip: compare `overlay --still` images made "
+                  "with and without --stabilize before trusting either.")
+        else:
+            print(f"Warning: couldn't compare {span} with the rest of the clip. The whole-clip "
+                  "image is too blurred or featureless to measure against, which is what a "
+                  "camera drifting throughout looks like. If it did, use --stabilize here "
+                  "and on `track`.")
+        return
+    distance = math.hypot(*shift)
+    if distance <= 2.0:
+        print(f"Camera check: {span} line up with the rest of the clip "
+              f"(within {distance:.1f}px).")
+    elif args.stabilize:
+        print(f"Warning: even after stabilizing, {span} sit {distance:.1f}px off the plate "
+              "tracking uses, so readings may be off by that much. Stabilization treats "
+              "shifts under ~4px as water noise, or couldn't measure these frames.")
+    else:
+        print(f"Warning: during {span} the camera sits {distance:.1f}px from where it is for "
+              "the rest of the clip. It moved, perhaps knocked while the markers went in or "
+              "out. Every mark would be off by that much against tracked positions. Re-run "
+              "this and `track` with --stabilize, which corrects for it.")
+
+
 def _run_calibrate(args) -> None:
-    from .calibration import Calibration, ReferenceLine
-    from .frames import frame_size, median_background
+    from .calibration import (
+        Calibration, bend_report, coincident_lines, reference_line_from_clicks,
+    )
+    from .frames import frame_size
     from .pointpicker import label_keypoints
+    from .tracking import calibration_reference
+
+    # Fail before building the reference image or opening any window.
+    mark_lists = _mark_lists(args)
+    frames = _frame_range(args)
+    reference_kind = "stabilized" if args.stabilize else "median"
+    previous = {}
+    if args.edit:
+        if not os.path.exists(args.out_json):
+            raise SystemExit(f"--edit reopens the clicks saved in {args.out_json}, "
+                             "which doesn't exist yet.")
+        saved = Calibration.load(args.out_json)
+        previous = {line.name: {f"{w:g}m": (x, y) for x, y, w in line.knots}
+                    for line in saved.lines}
+        if (saved.reference, saved.frames) != (reference_kind, frames):
+            print("Note: those clicks were made on a different reference image "
+                  f"({saved.reference}, frames {saved.frames or 'all'}); check each still "
+                  "sits on its mark.")
 
     _ensure_parent(args.out_json)
-    print(f"Building a median reference image from {args.max_samples} frames...")
-    reference = median_background(args.input_video, max_samples=args.max_samples)
-    names = [f"{mark:g}m" for mark in args.marks]
+    reference, plate = calibration_reference(args.input_video, frames, args.stabilize,
+                                             args.max_samples, progress=True)
+    if frames is not None:
+        _check_calibration_frames(args, reference, plate, frames)
 
     lines = []
-    for line_name in args.line:
+    for line_name, marks in zip(args.line, mark_lists):
+        names = [f"{mark:g}m" for mark in marks]
+        existing = {k: v for k, v in previous.get(line_name, {}).items() if k in names}
         placed = label_keypoints(
             reference, names,
-            title=f"{line_name}: click each distance mark along this line.",
+            title=f"{line_name}: click each mark along this line (s = not visible here).",
+            existing=existing or None,
         )
         if placed is None:
             raise SystemExit(f"Cancelled while labelling {line_name}.")
-        knots = [
-            (float(placed[name][0]), float(placed[name][1]), float(mark))
-            for name, mark in zip(names, args.marks)
-            if placed.get(name) is not None
-        ]
-        if len(knots) < 2:
-            raise SystemExit(f"{line_name}: need at least 2 marks, got {len(knots)}.")
-        lines.append(ReferenceLine(name=line_name, knots=knots))
-        print(f"{line_name}: {len(knots)} marks recorded.")
+        line, reason = reference_line_from_clicks(line_name, placed, names, marks)
+        if line is None:
+            print(f"Skipping {line_name}: {reason}.")
+            continue
+        lines.append(line)
+        print(f"{line_name}: {len(line.knots)} marks recorded.")
+
+    if not lines:
+        raise SystemExit(
+            "No usable reference lines, so nothing was saved. Each line needs at least "
+            "two visible marks whose real distances you know -- try different --marks."
+        )
+    for first, second in coincident_lines(lines):
+        print(f"Warning: '{first}' and '{second}' were clicked in the same places, so they "
+              "are one line counted twice. The second line should run somewhere else in "
+              "the frame, e.g. a row of markers at swimmer depth above a floor row.")
+    if len(lines) == 1:
+        print("One reference line: every reading comes from it whatever the swimmer's "
+              "height in the frame, which is right for a level camera square-on to the "
+              "lane. A second row of markers at swimmer depth would measure any tilt.")
 
     calibration = Calibration(
-        lines=lines, frame_size=frame_size(args.input_video), video=args.input_video
+        lines=lines, frame_size=frame_size(args.input_video), video=args.input_video,
+        reference=reference_kind, frames=frames,
     )
     calibration.save(args.out_json)
     print(f"Calibration saved to: {args.out_json}")
@@ -274,6 +461,13 @@ def _run_calibrate(args) -> None:
         middle = (low + high) / 2
         print(f"Depth ambiguity at x={middle:.0f}px: "
               f"{calibration.depth_ambiguity(middle):.2f}m between reference lines.")
+
+    print("\nHow the marks check out against each other:")
+    for line in lines:
+        print("\n".join(bend_report(line)))
+    print("\nTo see the lines and your clicked marks on the reference image:\n"
+          f"  uv run python -m analysis overlay {args.input_video} <out.png> "
+          f"--calibration {args.out_json} --still")
 
 
 def _run_label(args) -> None:
@@ -434,6 +628,39 @@ def main(argv=None) -> None:
 
     elif args.command == "analyze":
         _run_analyze(args)
+
+    elif args.command == "overlay":
+        if args.calibration is None and args.boxes is None:
+            raise SystemExit("Give --calibration, --boxes, or both.")
+        import pandas as pd
+
+        from .calibration import Calibration
+        from .overlay import draw_calibration_still, draw_overlay
+
+        _ensure_parent(args.out_video)
+        if args.still:
+            if args.calibration is None:
+                raise SystemExit("--still draws a calibration's lines; pass --calibration.")
+            if not args.out_video.lower().endswith((".png", ".jpg", ".jpeg")):
+                raise SystemExit("--still writes a picture: give an output path ending .png")
+            from .tracking import calibration_reference
+
+            calibration = Calibration.load(args.calibration)
+            # Rebuilt exactly as calibrate built it, so the marks show under
+            # their rings -- including markers only down for calibration.frames.
+            reference, _ = calibration_reference(
+                args.input_video, calibration.frames, calibration.reference == "stabilized",
+                args.max_samples, progress=True,
+            )
+            draw_calibration_still(reference, calibration, args.out_video, every=args.every)
+            return
+        draw_overlay(
+            args.input_video,
+            args.out_video,
+            boxes=pd.read_csv(args.boxes) if args.boxes else None,
+            calibration=Calibration.load(args.calibration) if args.calibration else None,
+            every=args.every,
+        )
 
     elif args.command == "body-length":
         _run_body_length(args)

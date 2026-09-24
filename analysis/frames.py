@@ -115,17 +115,29 @@ def iter_frames(
         cap.release()
 
 
-def sample_frames(video_path: str, max_samples: int = 120) -> List[np.ndarray]:
-    """Up to max_samples frames spread evenly across the whole clip."""
+def sample_frames(
+    video_path: str,
+    max_samples: int = 120,
+    start_frame: int = 1,
+    end_frame: Optional[int] = None,
+) -> List[np.ndarray]:
+    """Up to max_samples frames spread evenly across the clip, or across
+    start_frame..end_frame (1-indexed, inclusive) when given."""
     total = frame_count(video_path)
     if total <= 0:
         # some containers don't report a frame count; fall back to reading all
-        return [frame for _, frame in iter_frames(video_path)][:max_samples]
-    stride = max(1, total // max_samples)
-    return [frame for _, frame in iter_frames(video_path, stride=stride)][:max_samples]
+        return [frame for _, frame in iter_frames(video_path, start_frame, end_frame)][:max_samples]
+    last = total if end_frame is None else min(end_frame, total)
+    stride = max(1, (last - start_frame + 1) // max_samples)
+    return [frame for _, frame in iter_frames(video_path, start_frame, last, stride)][:max_samples]
 
 
-def median_background(video_path: str, max_samples: int = 120) -> np.ndarray:
+def median_background(
+    video_path: str,
+    max_samples: int = 120,
+    start_frame: int = 1,
+    end_frame: Optional[int] = None,
+) -> np.ndarray:
     """
     Per-pixel median across frames spread over the clip: a static
     background plate with moving things (swimmer, ripple) removed.
@@ -133,8 +145,13 @@ def median_background(video_path: str, max_samples: int = 120) -> np.ndarray:
     max_samples trades accuracy for memory and time -- every sample is
     held in RAM at once, so 120 frames of 1624x320 is ~180MB, while a
     1080p clip would want a much lower number.
+
+    start_frame/end_frame restrict it to part of the clip -- e.g. the few
+    seconds when calibration markers were on the pool floor. Over the whole
+    clip those markers would vanish from the median like anything else that
+    isn't there most of the time.
     """
-    samples = sample_frames(video_path, max_samples)
+    samples = sample_frames(video_path, max_samples, start_frame, end_frame)
     if not samples:
         raise RuntimeError(f"No frames could be read from {video_path}.")
     return np.median(np.stack(samples), axis=0).astype(np.uint8)

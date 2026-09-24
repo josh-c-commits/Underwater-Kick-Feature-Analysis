@@ -66,7 +66,24 @@ class _ZoomPanView:
         self.fig, self.ax = plt.subplots(figsize=(fig_w, fig_h))
         self.ax.imshow(display)
         self._home = (self.ax.get_xlim(), self.ax.get_ylim())
+        self._disable_default_keymap()
         # subclasses call _redraw() once their own state is in place
+
+    def _disable_default_keymap(self) -> None:
+        """Detach matplotlib's built-in keyboard shortcuts from this window.
+
+        Matplotlib binds several keys by default that collide with this
+        window's controls: 's' opens a save-figure dialog (which steals focus,
+        so "skip" registers only intermittently), 'p' toggles pan mode (which
+        then hijacks clicks), and left/right/backspace step through view
+        history. Every key this window responds to is handled explicitly, so
+        the defaults are removed rather than worked around.
+        """
+        manager = getattr(self.fig.canvas, "manager", None)
+        handler_id = getattr(manager, "key_press_handler_id", None)
+        if handler_id is not None:
+            self.fig.canvas.mpl_disconnect(handler_id)
+            manager.key_press_handler_id = None
 
     # ---- view helpers ----
 

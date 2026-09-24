@@ -6,7 +6,9 @@ import pytest
 
 from analysis.analysis import (
     body_length_series,
+    camera_path,
     derivative,
+    direction_of_travel,
     dominant_frequency,
     kinematics,
     smooth,
@@ -175,3 +177,69 @@ def test_summarize_counts_lost_frames_separately():
     summary = summarize(kinematics(_boxes(positions), FPS), FPS)
     assert summary["frames"] == 50
     assert summary["tracked_frames"] == 45
+
+
+# ---------- camera path ----------
+
+def test_camera_path_is_zero_without_camera_columns():
+    dx, dy = camera_path(_boxes(np.arange(10, dtype=float)))
+    assert (dx == 0).all() and (dy == 0).all()
+
+
+def test_camera_path_interpolates_unreliable_frames():
+    boxes = _boxes(np.arange(5, dtype=float))
+    boxes["cam_dx"] = [0.0, np.nan, np.nan, 3.0, 4.0]
+    boxes["cam_dy"] = np.nan  # nothing usable at all
+    dx, dy = camera_path(boxes)
+    assert dx == pytest.approx([0.0, 1.0, 2.0, 3.0, 4.0])
+    assert (dy == 0).all()
+
+
+def test_kinematics_measures_in_pool_coordinates_not_frame_coordinates():
+    # the swimmer moves 3 px/frame through the pool while the camera drifts
+    # 2 px/frame the same way, so the frame shows 5 px/frame
+    n = 100
+    boxes = _boxes(np.arange(n) * 5.0)
+    boxes["cam_dx"] = np.arange(n) * 2.0
+    boxes["cam_dy"] = 0.0
+    table = kinematics(boxes, FPS)
+
+    assert table["centroid_x"].iloc[50] == pytest.approx(250.0), "raw detection kept as-is"
+    assert table["speed_px_s"].iloc[10:-10].mean() == pytest.approx(3 * FPS, rel=0.02)
+
+
+# ---------- direction and leading edge ----------
+
+def test_direction_of_travel():
+    assert direction_of_travel(np.arange(50.0)) == 1
+    assert direction_of_travel(np.arange(50.0)[::-1]) == -1
+    assert direction_of_travel([np.nan, 3.0]) == 0
+
+
+def test_leading_edge_is_the_edge_facing_the_direction_of_travel():
+    right = _boxes(np.arange(0, 300, 3, dtype=float))
+    right["edge_left"], right["edge_right"] = right["centroid_x"] - 10, right["centroid_x"] + 40
+    left = _boxes(np.arange(300, 0, -3, dtype=float))
+    left["edge_left"], left["edge_right"] = left["centroid_x"] - 40, left["centroid_x"] + 10
+
+    r = kinematics(right, FPS)
+    l = kinematics(left, FPS)
+    assert (r["lead_x_smooth"] - r["x_smooth"]).iloc[10:-10].mean() == pytest.approx(40, abs=0.5)
+    assert (l["x_smooth"] - l["lead_x_smooth"]).iloc[10:-10].mean() == pytest.approx(40, abs=0.5)
+
+
+def test_leading_edge_is_absent_for_tables_without_edges():
+    assert "lead_x_smooth" not in kinematics(_boxes(np.arange(0, 300, 3, dtype=float)), FPS)
+
+
+def test_summary_peak_speed_is_the_fastest_moment_for_right_to_left_swimmers():
+    # speed oscillates 2..4 px/frame; moving leftward, so image speeds are negative.
+    # max() of the raw signed speeds would report the SLOWEST moment.
+    t = np.arange(240)
+    per_frame = 3.0 + np.sin(2 * np.pi * t / 60)
+    positions = 2000.0 - np.cumsum(per_frame)
+    summary = summarize(kinematics(_boxes(positions), FPS, smooth_window=5), FPS)
+
+    assert summary["direction"] == "right-to-left"
+    assert summary["mean_speed"] == pytest.approx(3.0 * FPS, rel=0.05)
+    assert summary["peak_speed"] == pytest.approx(4.0 * FPS, rel=0.08)

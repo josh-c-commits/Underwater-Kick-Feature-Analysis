@@ -26,14 +26,13 @@ information that later stages can't recover.
 from __future__ import annotations
 
 import os
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
 import pandas as pd
 
-from .frames import fps as video_fps
-from .frames import frame_size, iter_frames, median_background
+from .frames import iter_frames, median_background
 
 BOX_COLUMNS = [
     "frame",
@@ -45,6 +44,14 @@ BOX_COLUMNS = [
     "centroid_x",
     "centroid_y",
     "area",
+    # robust extents of the blob (low/high percentile of its pixel x-coords) --
+    # the leading edge is whichever one faces the direction of travel
+    "edge_left",
+    "edge_right",
+    # camera offset from the background plate this frame; 0 without
+    # stabilization, or when stabilization found no real camera motion
+    "cam_dx",
+    "cam_dy",
 ]
 
 
@@ -97,8 +104,25 @@ def crop_to_frame_norm(
     )
 
 
+def correlation_window(shape: Tuple[int, int]) -> np.ndarray:
+    """
+    Hanning taper for phase correlation, sized to an image of `shape` (h, w).
+
+    Phase correlation treats the image as periodic, so the hard jump where the
+    right edge meets the left (and top meets bottom) becomes a strong feature --
+    one that never moves, because the image border is fixed in frame
+    coordinates. Untapered, that feature dominates whenever the scene itself is
+    weak (a median plate smeared by drift) and drags every estimate toward zero:
+    on footage with a known 47px drift it produced a 14.5px median error. With
+    the taper fading the borders out, the same measurement came to 1.1px.
+    """
+    return cv2.createHanningWindow((shape[1], shape[0]), cv2.CV_32F)
+
+
 def estimate_translation(
-    frame_gray: np.ndarray, reference_gray: np.ndarray
+    frame_gray: np.ndarray,
+    reference_gray: np.ndarray,
+    window: Optional[np.ndarray] = None,
 ) -> Tuple[float, float, float]:
     """
     (dx, dy, response): the sub-pixel shift mapping `reference_gray` onto
@@ -114,9 +138,323 @@ def estimate_translation(
     the estimate should not be trusted.
     """
     shift, response = cv2.phaseCorrelate(
-        np.float32(reference_gray), np.float32(frame_gray)
+        np.float32(reference_gray), np.float32(frame_gray), window
     )
     return float(shift[0]), float(shift[1]), float(response)
+
+
+def estimate_translation_consensus(
+    frame_gray: np.ndarray,
+    reference_gray: np.ndarray,
+    grid: Tuple[int, int] = (4, 2),
+    min_response: float = 0.5,
+    min_fraction: float = 0.5,
+) -> Tuple[float, float, float]:
+    """
+    (dx, dy, agreement): the shift mapping `reference_gray` onto `frame_gray`,
+    as the median over a grid of tiles, where agreement is the fraction of
+    tiles that correlated confidently. dx and dy are NaN when fewer than
+    `min_fraction` of tiles did.
+
+    Why tiles: a single whole-frame correlation reports whatever moves most
+    coherently. With little background texture, that is the swimmer -- and
+    their motion then gets "corrected" away as if it were the camera's, the
+    swimmer is absorbed into the background plate, and tracking silently
+    loses them. Real camera motion moves every tile at once, while a swimmer
+    occupies one or two and is outvoted by the median. And if too few tiles
+    carry texture to say anything, the honest answer is "unmeasurable", not
+    a guess. On real footage tiles correlated at 0.62-0.95 (10th percentile
+    to median); textureless ones sat near 0.3, hence the 0.5 default.
+    """
+    height, width = frame_gray.shape[:2]
+    cols, rows = grid
+    tile_h, tile_w = height // rows, width // cols
+    if tile_h < 16 or tile_w < 16:
+        cols, rows = 1, 1
+        tile_h, tile_w = height, width
+    window = correlation_window((tile_h, tile_w))
+    reference = np.float32(reference_gray)
+    frame = np.float32(frame_gray)
+
+    shifts = []
+    for row in range(rows):
+        for col in range(cols):
+            ys = slice(row * tile_h, (row + 1) * tile_h)
+            xs = slice(col * tile_w, (col + 1) * tile_w)
+            (dx, dy), response = cv2.phaseCorrelate(reference[ys, xs], frame[ys, xs], window)
+            if response >= min_response:
+                shifts.append((dx, dy))
+
+    agreement = len(shifts) / float(rows * cols)
+    if agreement < min_fraction:
+        return float("nan"), float("nan"), agreement
+    dx, dy = np.median(np.asarray(shifts), axis=0)
+    return float(dx), float(dy), agreement
+
+
+def _prepared_gray(frame: np.ndarray, blur: int) -> np.ndarray:
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    if blur > 1:
+        gray = cv2.GaussianBlur(gray, (blur | 1, blur | 1), 0)
+    return gray.astype(np.float32)
+
+
+def measure_camera_motion(
+    video_path: str,
+    plate_gray: np.ndarray,
+    blur: int = 5,
+    min_response: float = 0.5,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Two independent measurements of where the camera is on each frame, taken
+    in a single read of the video, as (relative, absolute) arrays of shape (n, 2).
+
+    relative: frame-to-frame shifts (tile consensus), summed from frame 1.
+        Precise from one frame to the next (~0.04px), but tiny per-step biases
+        accumulate -- about 7px over a 10-second clip, even with no camera
+        motion at all.
+    absolute: each frame against the plain median plate (whole frame, tapered).
+        Never accumulates, but noisy frame to frame, and garbage whenever the
+        plate is featureless or smeared by steady drift.
+
+    Neither is usable alone; fuse_camera_path combines their strengths.
+    """
+    relative = [(0.0, 0.0)]
+    absolute = []
+    previous = None
+    window = None
+    for _, frame in iter_frames(video_path):
+        gray = _prepared_gray(frame, blur)
+        if window is None:
+            window = correlation_window(gray.shape)
+        (ax, ay), _ = cv2.phaseCorrelate(plate_gray, gray, window)
+        absolute.append((ax, ay))
+        if previous is not None:
+            dx, dy, _ = estimate_translation_consensus(gray, previous, min_response=min_response)
+            if not np.isfinite(dx):
+                dx, dy = 0.0, 0.0  # no measurable camera motion this step
+            last = relative[-1]
+            relative.append((last[0] + dx, last[1] + dy))
+        previous = gray
+    return np.asarray(relative, dtype=float), np.asarray(absolute, dtype=float)
+
+
+def fuse_camera_path(
+    relative: np.ndarray,
+    absolute: np.ndarray,
+    window: int = 61,
+    max_spread: float = 2.0,
+) -> np.ndarray:
+    """
+    Complementary filter: the relative path's frame-to-frame precision, anchored
+    by the absolute measurement so it can't wander off.
+
+    The gap between them (absolute - relative) is the relative path's slowly
+    accumulated error plus the absolute measurement's fast noise. A rolling
+    median of that gap keeps the slow part, which is exactly the correction the
+    relative path needs, and discards the noise.
+
+    The gate is what makes this safe. Where the absolute measurement is valid,
+    the gap barely moves within a window: a spread of 0.1-0.3px on real footage.
+    Where it's garbage -- a featureless plate, or one smeared by drift -- the
+    gap scatters by 9-60px. Scattering windows are discarded and bridged from
+    trustworthy neighbours; if nothing is trustworthy, the relative path stands
+    alone. Without this gate, a single textureless clip produced corrections
+    that were off by 2500px.
+    """
+    gap = pd.DataFrame(absolute - relative)
+    min_periods = max(3, window // 4)
+    center = gap.rolling(window, center=True, min_periods=min_periods).median()
+    spread = (gap - center).abs().rolling(window, center=True, min_periods=min_periods).median()
+    trusted = (spread.max(axis=1) <= max_spread).to_numpy()
+
+    correction = center.copy()
+    correction.loc[~trusted, :] = np.nan
+    correction = correction.interpolate(limit_direction="both").fillna(0.0)
+    return relative + correction.to_numpy()
+
+
+def camera_moved(
+    offsets: np.ndarray, motion_floor: float = 4.0, min_moved_frames: int = 5
+) -> bool:
+    """
+    Whether an estimated camera path shows motion beyond what water alone
+    produces on a camera that isn't moving.
+
+    Ripple fools phase correlation slightly on every frame. On a camera known to
+    be still, estimated offsets had a median of 0.6px and never exceeded 3.3px;
+    on genuinely drifting footage they sat around 12-14px. Applying ripple-noise
+    offsets isn't harmless -- warping the plate to chase water cost 13 of 558
+    tracked frames on a still clip -- so a clip counts as moving only if a few
+    frames are displaced well past that noise. A count rather than a single
+    maximum means one freak spike can't switch it on, while a real bump of a
+    handful of frames still does.
+    """
+    centred = offsets - np.median(offsets, axis=0)
+    magnitude = np.hypot(centred[:, 0], centred[:, 1])
+    return int(np.sum(magnitude > motion_floor)) >= min_moved_frames
+
+
+def stabilized_background(
+    video_path: str,
+    max_samples: int = 120,
+    blur: int = 5,
+    min_response: float = 0.5,
+    progress: bool = False,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    (plate, offsets): a background plate for a camera that moves, and each
+    frame's camera offset from it, shape (n, 2).
+
+    Both tracking and calibration build their reference through this, so they
+    share one coordinate frame. A calibration clicked on one plate and positions
+    measured against a different one would disagree by however far apart the
+    two plates sit.
+    """
+    if progress:
+        print("Measuring camera motion (pass 1 of 2)...")
+    plain = median_background(video_path, max_samples=max_samples)
+    relative, absolute = measure_camera_motion(
+        video_path, _prepared_gray(plain, blur), blur, min_response
+    )
+    first_path = fuse_camera_path(relative, absolute)
+
+    if not camera_moved(first_path):
+        # Nothing to correct: the estimates are ripple noise. Returning the plain
+        # plate and zero offsets makes stabilizing a steady clip an exact no-op
+        # rather than a small, systematic degradation.
+        if progress:
+            print("No camera motion beyond water noise; treating the camera as fixed.")
+        return plain, np.zeros_like(first_path)
+
+    if progress:
+        print(f"Building aligned background from up to {max_samples} frames...")
+    plate = aligned_background(video_path, first_path, max_samples=max_samples)
+
+    # Refinement. The first anchor was measured against the plain median, which
+    # drift smears -- and matching against a smeared image pulls every estimate
+    # toward its centre (it reported 94% of the true motion). Re-measuring
+    # against the aligned plate removes that, and also expresses each offset
+    # directly relative to the plate the offsets will be applied to. On footage
+    # with a known 47px drift this took the median error from 0.81px to 0.52px
+    # and the worst case from 5.1px to 3.4px.
+    if progress:
+        print("Measuring camera motion (pass 2 of 2)...")
+    plate_gray = _prepared_gray(plate, blur)
+    window = correlation_window(plate_gray.shape)
+    refined_absolute = np.asarray(
+        [cv2.phaseCorrelate(plate_gray, _prepared_gray(frame, blur), window)[0]
+         for _, frame in iter_frames(video_path)],
+        dtype=float,
+    )
+    return plate, fuse_camera_path(relative, refined_absolute)
+
+
+def aligned_background(
+    video_path: str,
+    path: np.ndarray,
+    max_samples: int = 120,
+    min_align: float = 1.0,
+    home: Optional[Tuple[float, float]] = None,
+    start_frame: int = 1,
+    end_frame: Optional[int] = None,
+) -> np.ndarray:
+    """
+    Background plate built from frames shifted back into register first.
+
+    A plain median of a drifting clip averages the scene across every camera
+    position, so every edge is smeared. Undoing each sample's offset before
+    taking the median keeps the plate sharp. Samples are aligned to the path's
+    *median* position rather than frame 1: the opening frames are often the
+    camera still being aimed, which makes frame 1 an unrepresentative home.
+
+    Samples within min_align of home are used as-is. Resampling them would only
+    blur the plate by interpolation for a sub-pixel gain, and on a steady camera
+    -- where every offset is sub-pixel noise -- that blur alone cost 11 of 558
+    tracked frames. With the threshold, a steady camera gets exactly the plain
+    median back.
+
+    home: where to align to instead of the path's median. Pass (0, 0) with the
+    offsets from stabilized_background to land in that plate's coordinates.
+    start_frame/end_frame: build from part of the clip only (1-indexed,
+    inclusive). Together these give a calibration reference from just the
+    frames where markers were down, in the same coordinates tracking uses.
+    """
+    last = len(path) if end_frame is None else min(end_frame, len(path))
+    stride = max(1, (last - start_frame + 1) // max_samples)
+    home = np.median(path, axis=0) if home is None else np.asarray(home, dtype=float)
+    samples = []
+    for number, frame in iter_frames(video_path, start_frame, last, stride):
+        dx, dy = path[number - 1] - home
+        if np.hypot(dx, dy) < min_align:
+            samples.append(frame)
+        else:
+            height, width = frame.shape[:2]
+            matrix = np.float32([[1.0, 0.0, -dx], [0.0, 1.0, -dy]])
+            samples.append(cv2.warpAffine(frame, matrix, (width, height),
+                                          borderMode=cv2.BORDER_REFLECT))
+        if len(samples) >= max_samples:
+            break
+    if not samples:
+        raise RuntimeError(f"No frames could be read from {video_path}.")
+    return np.median(np.stack(samples), axis=0).astype(np.uint8)
+
+
+def calibration_reference(
+    video_path: str,
+    frames: Optional[Tuple[int, int]] = None,
+    stabilize: bool = False,
+    max_samples: int = 120,
+    progress: bool = False,
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """
+    (reference, plate): the image calibration marks are clicked on, and the
+    plate `track` measures positions against -- or None for the plate when it
+    would take an extra pass to build and isn't the reference itself.
+
+    frames: (first, last) to build the reference from only those frames, for
+    markers that were on the pool floor for part of the clip. With stabilize,
+    each of those frames is shifted into the stabilized plate's coordinates
+    first, so the marks land where tracking will measure positions even if the
+    camera moved between placing the markers and the swim.
+    """
+    if stabilize:
+        plate, offsets = stabilized_background(video_path, max_samples=max_samples,
+                                               progress=progress)
+        if frames is None:
+            return plate, plate
+        if progress:
+            print(f"Building the reference from frames {frames[0]}-{frames[1]}...")
+        reference = aligned_background(video_path, offsets, max_samples=max_samples,
+                                       home=(0.0, 0.0), start_frame=frames[0],
+                                       end_frame=frames[1])
+        return reference, plate
+    if frames is None:
+        if progress:
+            print(f"Building a median reference image from {max_samples} frames...")
+        reference = median_background(video_path, max_samples=max_samples)
+        return reference, reference
+    if progress:
+        print(f"Building the reference from frames {frames[0]}-{frames[1]}...")
+    return median_background(video_path, max_samples, frames[0], frames[1]), None
+
+
+def plate_offset(image: np.ndarray, plate: np.ndarray, blur: int = 5) -> Optional[Tuple[float, float]]:
+    """
+    (dx, dy) of `image` relative to `plate`, or None when it can't be measured
+    (too little texture, or the tiles disagree).
+
+    Used to check that a calibration reference built from part of a clip sits
+    where the tracking plate does. A camera nudged while markers were placed or
+    removed offsets every clicked mark by the same amount, and nothing
+    downstream would notice.
+    """
+    dx, dy, _ = estimate_translation_consensus(
+        _prepared_gray(image, blur), _prepared_gray(plate, blur)
+    )
+    if not np.isfinite(dx):
+        return None
+    return dx, dy
 
 
 def shift_image(image: np.ndarray, dx: float, dy: float) -> np.ndarray:
@@ -157,35 +495,30 @@ def _binary_diff(
     blur: int,
     roi: Optional[Tuple[int, int]],
     sigma: float,
-    stabilize: bool = False,
-    min_response: float = 0.02,
+    camera: Optional[Tuple[float, float]] = None,
     min_shift: float = 2.5,
 ) -> np.ndarray:
+    """Foreground mask for one frame, given the camera's offset from the plate
+    when stabilizing (None when the camera is taken as fixed)."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     if blur > 1:
         gray = cv2.GaussianBlur(gray, (blur | 1, blur | 1), 0)
 
     shift = (0.0, 0.0)
-    if stabilize:
-        dx, dy, response = estimate_translation(gray, background_gray)
-        # Below min_shift, correcting costs more than it fixes: warping
-        # resamples (and so slightly blurs) the plate, and blanking the border
-        # discards usable frame. Surface ripple alone produces a confident but
-        # meaningless sub-pixel estimate, and acting on it measurably worsened
-        # detection on steady footage (94% -> 90% tracked).
+    if camera is not None and np.isfinite(camera[0]) and np.hypot(*camera) >= min_shift:
+        # The *plate* moves onto the frame, never the reverse: shifting the
+        # frame would leave every detection in displaced coordinates needing an
+        # inverse correction, and any error there would quietly bias every
+        # position downstream.
         #
-        # The default separates the two regimes by measurement rather than
-        # taste: on a fixed camera the estimate never exceeded ~2.2px, while
-        # genuinely drifting footage reached 8px at p90 and 62px at worst.
-        # Anything under a couple of pixels is ripple; real movement is larger.
-        if response >= min_response and np.hypot(dx, dy) >= min_shift:
-            # The *plate* is warped onto the frame, never the other way round.
-            # Warping the frame would leave every detection in shifted
-            # coordinates that then have to be undone, and any mistake there
-            # silently biases every position downstream. Moving the reference
-            # instead keeps detections in true frame coordinates throughout.
-            background_gray = shift_image(background_gray, dx, dy)
-            shift = (dx, dy)
+        # Below min_shift the plate is left alone. Warping resamples (slightly
+        # blurring) the plate and blanking the border discards usable frame; on
+        # a steady camera that cost buys nothing, and acting on sub-2px offsets
+        # measurably worsened detection there (94% -> 90% tracked). Positions
+        # are still corrected by the full offset downstream -- this gate is only
+        # about whether warping helps *detection*.
+        background_gray = shift_image(background_gray, camera[0], camera[1])
+        shift = (camera[0], camera[1])
 
     diff = cv2.absdiff(gray, background_gray)
     if shift != (0.0, 0.0):
@@ -260,11 +593,13 @@ def _pick_component(
     predicted: Optional[Tuple[float, float]],
     max_jump: float,
     area_reference: Optional[float],
-    area_ratio: float,
+    max_area_ratio: float,
+    min_area_ratio: float,
+    edge_percentile: float = 98.0,
 ):
     """
-    Return (box, centroid, area) for the chosen blob, or None if nothing
-    passes the gates.
+    Return a dict describing the chosen blob -- box, centroid, area, and
+    robust left/right edges -- or None if nothing passes the gates.
 
     Returning None matters more than it looks. The obvious fallback --
     "take the biggest blob instead" -- is precisely how a tracker hops
@@ -283,10 +618,16 @@ def _pick_component(
         if roi is not None and not (roi[0] <= cy <= roi[1]):
             continue
         # A blob several times the size of the one we've been following is a
-        # different object, however close it happens to be right now.
+        # different object, however close it happens to be right now. The two
+        # bounds guard against different things: the upper one blocks
+        # defection to a bigger (nearer) swimmer; the lower one rejects body
+        # *fragments* -- an arm or the legs detected on their own, whose centroid
+        # sits well off the body's. Measured, loosening it from 1/3 to 1/4 only
+        # admitted detections a median 20px from the swimmer's true path, and
+        # 1/5 derailed tracking on drifting footage (83 frames lost, not gained).
         if area_reference is not None:
             ratio = area / area_reference
-            if ratio > area_ratio or ratio < 1.0 / area_ratio:
+            if ratio > max_area_ratio or ratio < min_area_ratio:
                 continue
         box = (
             int(stats[i, cv2.CC_STAT_LEFT]),
@@ -294,18 +635,26 @@ def _pick_component(
             int(stats[i, cv2.CC_STAT_WIDTH]),
             int(stats[i, cv2.CC_STAT_HEIGHT]),
         )
-        candidates.append((box, (cx, cy), area))
+        candidates.append((box, (cx, cy), area, i))
 
     if not candidates:
         return None
     if predicted is None:
-        return max(candidates, key=lambda c: c[2])
+        chosen = max(candidates, key=lambda c: c[2])
+    else:
+        px, py = predicted
+        chosen = min(candidates, key=lambda c: np.hypot(c[1][0] - px, c[1][1] - py))
+        if np.hypot(chosen[1][0] - px, chosen[1][1] - py) > max_jump:
+            return None
 
-    px, py = predicted
-    nearest = min(candidates, key=lambda c: np.hypot(c[1][0] - px, c[1][1] - py))
-    if np.hypot(nearest[1][0] - px, nearest[1][1] - py) > max_jump:
-        return None
-    return nearest
+    (x, y, w, h), centroid, area, label = chosen
+    # Percentiles of the blob's pixel columns rather than its extreme columns:
+    # the box edge is set by the single outermost pixel, so it jumps with any
+    # ripple that happens to touch the silhouette's boundary.
+    columns = np.nonzero(labels[y:y + h, x:x + w] == label)[1] + x
+    left, right = np.percentile(columns, [100.0 - edge_percentile, edge_percentile])
+    return {"box": (x, y, w, h), "centroid": centroid, "area": area,
+            "edges": (float(left), float(right))}
 
 
 def detect_boxes(
@@ -317,11 +666,13 @@ def detect_boxes(
     threshold: Optional[int] = None,
     sigma: float = 6.0,
     max_jump: float = 60.0,
-    area_ratio: float = 3.0,
+    max_area_ratio: float = 3.0,
+    min_area_ratio: float = 1.0 / 3.0,
     area_anchor_samples: int = 15,
+    edge_percentile: float = 98.0,
     max_radius_factor: float = 4.0,
     stabilize: bool = False,
-    min_response: float = 0.02,
+    min_response: float = 0.5,
     min_shift: float = 2.5,
     blur: int = 5,
     max_samples: int = 120,
@@ -349,6 +700,16 @@ def detect_boxes(
     than one lane occupied is usually the wrong person -- whoever is
     nearest the camera looks biggest. Strongly recommended.
     """
+    offsets = None
+    if stabilize:
+        if background is not None:
+            raise ValueError(
+                "Pass background=None with stabilize=True: the plate has to be built "
+                "from the estimated camera path, or offsets and plate won't agree."
+            )
+        background, offsets = stabilized_background(
+            video_path, max_samples, blur, min_response, progress
+        )
     if background is None:
         if progress:
             print(f"Building median background from up to {max_samples} frames...")
@@ -356,6 +717,7 @@ def detect_boxes(
     background_gray = cv2.cvtColor(background, cv2.COLOR_BGR2GRAY)
     if blur > 1:
         background_gray = cv2.GaussianBlur(background_gray, (blur | 1, blur | 1), 0)
+
 
     rows = []
     predicted: Optional[Tuple[float, float]] = (
@@ -367,9 +729,13 @@ def detect_boxes(
     coasting = 0
 
     for number, frame in iter_frames(video_path):
+        if offsets is not None and number - 1 < len(offsets):
+            cam_dx, cam_dy = float(offsets[number - 1][0]), float(offsets[number - 1][1])
+            camera = (cam_dx, cam_dy)
+        else:
+            cam_dx, cam_dy, camera = 0.0, 0.0, None
         binary = _binary_diff(frame, background_gray, threshold, blur, roi, sigma,
-                              stabilize=stabilize, min_response=min_response,
-                              min_shift=min_shift)
+                              camera=camera, min_shift=min_shift)
         # Anchored to the first few accepted areas, never a rolling window. A
         # rolling reference drifts: each slightly-larger blob shifts the median,
         # which admits a larger one still, and the gate walks itself onto a
@@ -382,13 +748,18 @@ def detect_boxes(
         # lets the box teleport across the frame onto another lane entirely.
         radius = max_jump * min(1.0 + coasting, max_radius_factor)
         hit = _pick_component(
-            binary, min_area, roi, predicted, radius, area_reference, area_ratio
+            binary, min_area, roi, predicted, radius, area_reference,
+            max_area_ratio, min_area_ratio, edge_percentile,
         )
 
         if hit is None:
+            # The camera offset is still recorded on lost frames: the camera
+            # moved whether or not the swimmer was found, and an overlay drawn
+            # on this frame needs to know where the pool is.
             rows.append({"frame": number, "found": False, "box_x": None, "box_y": None,
                          "box_w": None, "box_h": None, "centroid_x": None,
-                         "centroid_y": None, "area": 0})
+                         "centroid_y": None, "area": 0, "edge_left": None,
+                         "edge_right": None, "cam_dx": cam_dx, "cam_dy": cam_dy})
             # Coast on the last known velocity for a few frames: a swimmer
             # briefly occluded (bubbles, a crossing swimmer) is still where
             # physics says they are, so re-acquisition should find them.
@@ -401,10 +772,11 @@ def detect_boxes(
                 predicted = (predicted[0] + velocity[0], predicted[1] + velocity[1])
             continue
 
-        (bx, by, bw, bh), (cx, cy), area = hit
+        (bx, by, bw, bh), (cx, cy), area = hit["box"], hit["centroid"], hit["area"]
         rows.append({"frame": number, "found": True, "box_x": bx, "box_y": by,
                      "box_w": bw, "box_h": bh, "centroid_x": cx,
-                     "centroid_y": cy, "area": area})
+                     "centroid_y": cy, "area": area, "edge_left": hit["edges"][0],
+                     "edge_right": hit["edges"][1], "cam_dx": cam_dx, "cam_dy": cam_dy})
 
         velocity = (cx - previous[0], cy - previous[1]) if previous else (0.0, 0.0)
         predicted = (cx + velocity[0], cy + velocity[1])
@@ -418,32 +790,6 @@ def detect_boxes(
         found = int(table["found"].sum())
         print(f"Tracked {found}/{len(table)} frames ({found / max(len(table), 1):.0%}).")
     return table
-
-
-def draw_preview(video_path: str, boxes: pd.DataFrame, out_video: str) -> None:
-    """Write a copy of the video with the tracked box drawn on it."""
-    width, height = frame_size(video_path)
-    writer = cv2.VideoWriter(
-        out_video, cv2.VideoWriter_fourcc(*"mp4v"), video_fps(video_path), (width, height)
-    )
-    by_frame = boxes.set_index("frame")
-    try:
-        for number, frame in iter_frames(video_path):
-            if number in by_frame.index:
-                row = by_frame.loc[number]
-                if bool(row["found"]):
-                    x, y = int(row["box_x"]), int(row["box_y"])
-                    w, h = int(row["box_w"]), int(row["box_h"])
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                    cv2.circle(frame, (int(row["centroid_x"]), int(row["centroid_y"])),
-                               4, (0, 0, 255), -1)
-                else:
-                    cv2.putText(frame, "LOST", (12, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                                1.0, (0, 0, 255), 2)
-            writer.write(frame)
-    finally:
-        writer.release()
-    print(f"Preview video saved to: {os.path.abspath(out_video)}")
 
 
 def contact_sheet(
