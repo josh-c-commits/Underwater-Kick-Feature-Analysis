@@ -1,7 +1,7 @@
 [project]
-name = "swim-project"
+name = "underwater-kick-feature-analysis"
 version = "0.1.0"
-description = "Add your description here"
+description = "Measure dolphin-kick kinematics from underwater video with classical computer vision."
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
@@ -11,9 +11,6 @@ dependencies = [
     "pandas>=2.3.3",
     "scipy>=1.13.1",
 ]
-
-[project.scripts]
-swim-project = "swim_project:main"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]
