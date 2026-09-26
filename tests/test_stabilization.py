@@ -275,3 +275,67 @@ def test_marker_frames_land_in_the_tracking_plates_coordinates(tmp_path):
     assert np.abs(offsets[:10]).max() > 15
     shift = plate_offset(reference, plate)
     assert shift is not None and np.hypot(*shift) < 2.0, "calibrate would warn"
+
+
+# ---------- phase correlation must not touch its inputs ----------
+
+from analysis.tracking import (  # noqa: E402
+    correlation_window,
+    estimate_translation_consensus,
+    measure_camera_motion,
+)
+
+
+def test_phase_correlation_leaves_its_inputs_alone():
+    """OpenCV multiplies both inputs by the window in place. Every caller here
+    reuses its images -- the plate against every frame -- so the side effect
+    compounded into a faded plate and 35px of invented motion on a steady clip."""
+    reference = textured().astype(np.float32)
+    frame = shift_image(reference, 4, -3)
+    before = (reference.copy(), frame.copy())
+
+    estimate_translation(frame, reference, window=correlation_window(reference.shape))
+    estimate_translation_consensus(frame, reference)
+
+    assert np.array_equal(reference, before[0])
+    assert np.array_equal(frame, before[1])
+
+
+def test_measuring_camera_motion_leaves_the_plate_alone(moving_square_video):
+    plate = cv2.cvtColor(textured(160, 320), cv2.COLOR_GRAY2BGR)
+    plate_gray = cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    before = plate_gray.copy()
+    measure_camera_motion(moving_square_video, plate_gray)
+    assert np.array_equal(plate_gray, before)
+
+
+# ---------- fusion at the ends of a clip ----------
+
+def test_fusion_follows_a_drifting_relative_path_right_to_the_ends():
+    """Moving light pulls every frame-to-frame match slightly, so the relative
+    path drifts even on a still camera. A centred median can't see past the
+    clip's ends and lags that drift there -- far enough, at 0.3px/frame, to
+    make a still camera look like it moved."""
+    rng = np.random.default_rng(0)
+    frames = 300
+    relative = np.outer(np.arange(frames), [0.3, -0.2])       # bias, no real motion
+    absolute = rng.normal(0.0, 0.5, (frames, 2))               # honest but noisy
+
+    fused = fuse_camera_path(relative, absolute)
+
+    error = np.hypot(fused[:, 0], fused[:, 1])
+    assert error[:30].max() < 1.5 and error[-30:].max() < 1.5, "the ends lag the drift"
+    assert error.max() < 1.5
+    assert not camera_moved(fused)
+
+
+def test_fusion_on_a_clip_shorter_than_its_window():
+    """Every frame of a 40-frame clip is within half a window of an end."""
+    rng = np.random.default_rng(1)
+    truth = np.outer(np.arange(40), [1.5, 0.6])
+    relative = truth + np.outer(np.arange(40), [0.1, 0.1])    # slightly biased steps
+    absolute = truth + rng.normal(0.0, 0.5, (40, 2))
+
+    fused = fuse_camera_path(relative, absolute)
+
+    assert np.abs(fused - truth).max() < 1.5

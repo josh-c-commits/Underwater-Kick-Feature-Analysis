@@ -114,9 +114,28 @@ def correlation_window(shape: Tuple[int, int]) -> np.ndarray:
     coordinates. Untapered, that feature dominates whenever the scene itself is
     weak (a median plate smeared by drift) and drags every estimate toward zero:
     on footage with a known 47px drift it produced a 14.5px median error. With
-    the taper fading the borders out, the same measurement came to 1.1px.
+    the taper fading the borders out, the same measurement came to 0.5px.
     """
     return cv2.createHanningWindow((shape[1], shape[0]), cv2.CV_32F)
+
+
+def _phase_correlate(
+    reference: np.ndarray, image: np.ndarray, window: Optional[np.ndarray] = None
+) -> Tuple[Tuple[float, float], float]:
+    """
+    cv2.phaseCorrelate without its side effect: given a window, OpenCV
+    multiplies *both input arrays* by it in place before correlating.
+
+    Callers here reuse their images. The plate is compared against every frame,
+    so it was faded once per frame until only a patch at its centre survived,
+    and each frame reached the next frame-to-frame match already tapered. On a
+    steady 1080p clip that turned a few pixels of drift into 35px of invented
+    camera motion. Tapering copies instead leaves the inputs as they were.
+    """
+    reference, image = np.float32(reference), np.float32(image)
+    if window is not None:
+        reference, image = reference * window, image * window
+    return cv2.phaseCorrelate(reference, image)
 
 
 def estimate_translation(
@@ -137,9 +156,7 @@ def estimate_translation(
     will instead show up as a weak `response`, which is the caller's cue that
     the estimate should not be trusted.
     """
-    shift, response = cv2.phaseCorrelate(
-        np.float32(reference_gray), np.float32(frame_gray), window
-    )
+    shift, response = _phase_correlate(reference_gray, frame_gray, window)
     return float(shift[0]), float(shift[1]), float(response)
 
 
@@ -173,15 +190,14 @@ def estimate_translation_consensus(
         cols, rows = 1, 1
         tile_h, tile_w = height, width
     window = correlation_window((tile_h, tile_w))
-    reference = np.float32(reference_gray)
-    frame = np.float32(frame_gray)
 
     shifts = []
     for row in range(rows):
         for col in range(cols):
             ys = slice(row * tile_h, (row + 1) * tile_h)
             xs = slice(col * tile_w, (col + 1) * tile_w)
-            (dx, dy), response = cv2.phaseCorrelate(reference[ys, xs], frame[ys, xs], window)
+            (dx, dy), response = _phase_correlate(reference_gray[ys, xs], frame_gray[ys, xs],
+                                                  window)
             if response >= min_response:
                 shifts.append((dx, dy))
 
@@ -210,9 +226,11 @@ def measure_camera_motion(
     in a single read of the video, as (relative, absolute) arrays of shape (n, 2).
 
     relative: frame-to-frame shifts (tile consensus), summed from frame 1.
-        Precise from one frame to the next (~0.04px), but tiny per-step biases
-        accumulate -- about 7px over a 10-second clip, even with no camera
-        motion at all.
+        Precise from one frame to the next (~0.04px), but biased: caustics and
+        surface shimmer move a fraction of a pixel per frame, too close to the
+        static pool's zero to separate, so each match is pulled slightly toward
+        the water's motion. Summed, that's ~10px over a 10-second cropped clip
+        and ~60px over the full 1080p frame, with no camera motion at all.
     absolute: each frame against the plain median plate (whole frame, tapered).
         Never accumulates, but noisy frame to frame, and garbage whenever the
         plate is featureless or smeared by steady drift.
@@ -227,7 +245,7 @@ def measure_camera_motion(
         gray = _prepared_gray(frame, blur)
         if window is None:
             window = correlation_window(gray.shape)
-        (ax, ay), _ = cv2.phaseCorrelate(plate_gray, gray, window)
+        (ax, ay), _ = _phase_correlate(plate_gray, gray, window)
         absolute.append((ax, ay))
         if previous is not None:
             dx, dy, _ = estimate_translation_consensus(gray, previous, min_response=min_response)
@@ -237,6 +255,23 @@ def measure_camera_motion(
             relative.append((last[0] + dx, last[1] + dy))
         previous = gray
     return np.asarray(relative, dtype=float), np.asarray(absolute, dtype=float)
+
+
+def _robust_line_at(values: np.ndarray, index: int, half: int) -> np.ndarray:
+    """
+    A Theil-Sen line through values[index - half : index + half + 1] (clipped to
+    the array), read off at `index`, per column. The slope is the median of all
+    pairwise slopes and the level the median of what's left after removing it,
+    so a few garbage points can't drag either.
+    """
+    lo, hi = max(0, index - half), min(len(values), index + half + 1)
+    t = np.arange(lo, hi, dtype=float) - index
+    first, second = np.triu_indices(hi - lo, 1)
+    levels = []
+    for column in values[lo:hi].T:
+        slope = np.median((column[second] - column[first]) / (t[second] - t[first]))
+        levels.append(np.median(column - slope * t))
+    return np.asarray(levels)
 
 
 def fuse_camera_path(
@@ -261,10 +296,26 @@ def fuse_camera_path(
     trustworthy neighbours; if nothing is trustworthy, the relative path stands
     alone. Without this gate, a single textureless clip produced corrections
     that were off by 2500px.
+
+    Within half a window of either end of the clip, the window is cut off on
+    one side, and a median of a drifting gap lags behind: on the first frame it
+    reports the gap as it stood ~15 frames later. The relative path always
+    drifts (see measure_camera_motion), so those frames use a robust line
+    through the available window instead, read at the frame itself. On a steady full-frame clip the median alone left
+    ~4px of error at the ends, nearly enough to declare the camera moving; on
+    footage with a known drift, the line cut the worst error from 3.4px to
+    2.7px and the last 30 frames' from 1.0px to 0.4px. A clip shorter than the
+    window is all ends, and on a 40-frame one the median error fell from 1.4px
+    to 0.4px.
     """
-    gap = pd.DataFrame(absolute - relative)
+    gap = pd.DataFrame(np.asarray(absolute, dtype=float) - np.asarray(relative, dtype=float))
     min_periods = max(3, window // 4)
     center = gap.rolling(window, center=True, min_periods=min_periods).median()
+    count, half = len(gap), window // 2
+    if count >= min_periods:
+        values = gap.to_numpy()
+        for index in sorted(set(range(min(half, count))) | set(range(max(0, count - half), count))):
+            center.iloc[index] = _robust_line_at(values, index, half)
     spread = (gap - center).abs().rolling(window, center=True, min_periods=min_periods).median()
     trusted = (spread.max(axis=1) <= max_spread).to_numpy()
 
@@ -281,8 +332,8 @@ def camera_moved(
     Whether an estimated camera path shows motion beyond what water alone
     produces on a camera that isn't moving.
 
-    Ripple fools phase correlation slightly on every frame. On a camera known to
-    be still, estimated offsets had a median of 0.6px and never exceeded 3.3px;
+    Ripple fools phase correlation slightly on every frame. On cameras known to
+    be still, cropped or full frame, estimated offsets never exceeded 2.9px;
     on genuinely drifting footage they sat around 12-14px. Applying ripple-noise
     offsets isn't harmless -- warping the plate to chase water cost 13 of 558
     tracked frames on a still clip -- so a clip counts as moving only if a few
@@ -336,14 +387,14 @@ def stabilized_background(
     # toward its centre (it reported 94% of the true motion). Re-measuring
     # against the aligned plate removes that, and also expresses each offset
     # directly relative to the plate the offsets will be applied to. On footage
-    # with a known 47px drift this took the median error from 0.81px to 0.52px
-    # and the worst case from 5.1px to 3.4px.
+    # with a known 47px drift this took the median error from 0.68px to 0.45px
+    # and the worst case from 5.3px to 2.9px.
     if progress:
         print("Measuring camera motion (pass 2 of 2)...")
     plate_gray = _prepared_gray(plate, blur)
     window = correlation_window(plate_gray.shape)
     refined_absolute = np.asarray(
-        [cv2.phaseCorrelate(plate_gray, _prepared_gray(frame, blur), window)[0]
+        [_phase_correlate(plate_gray, _prepared_gray(frame, blur), window)[0]
          for _, frame in iter_frames(video_path)],
         dtype=float,
     )
