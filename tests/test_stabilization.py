@@ -339,3 +339,27 @@ def test_fusion_on_a_clip_shorter_than_its_window():
     fused = fuse_camera_path(relative, absolute)
 
     assert np.abs(fused - truth).max() < 1.5
+
+
+# ---------- rows ignored by camera-motion measurement ----------
+
+def test_motion_above_the_ignored_line_is_not_taken_for_the_camera(tmp_path):
+    """A 'surface' sliding 3px a frame in the top third must not read as camera
+    motion once those rows are ignored; the static pool below holds still."""
+    base = cv2.cvtColor(textured(180, 320), cv2.COLOR_GRAY2BGR)
+    surface = cv2.cvtColor(textured(60, 640, seed=5), cv2.COLOR_GRAY2BGR)
+    frames = []
+    for i in range(30):
+        frame = base.copy()
+        frame[:60] = surface[:, i * 3:i * 3 + 320]
+        frames.append(frame)
+    path = write_video(tmp_path / "surface.mp4", frames)
+    plate = median_background(path, 30)
+    plate_gray = cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+    relative, absolute = measure_camera_motion(path, plate_gray, ignore_above=60)
+    assert np.abs(relative).max() < 0.5
+    assert np.abs(absolute - np.median(absolute, axis=0)).max() < 0.5
+
+
+from analysis.frames import median_background  # noqa: E402

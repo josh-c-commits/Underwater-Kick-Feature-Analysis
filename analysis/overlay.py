@@ -97,6 +97,23 @@ def _draw_knots(image, calibration) -> None:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
 
 
+def _draw_surface(image, calibration) -> None:
+    """The clicked rope points and the level surface line through them, which
+    depth is measured from: it should run along the rope."""
+    if getattr(calibration, "lens", None) is None or len(calibration.surface) < 2:
+        return
+    sx, sy = calibration.ideal(*np.array(calibration.surface, dtype=float).T)
+    row = float(np.mean(sy))
+    width = image.shape[1]
+    ux = np.linspace(-0.3 * width, 1.3 * width, 80)
+    xs, ys = calibration._from_ideal(ux, np.full(ux.shape, row))
+    points = [(int(round(x)), int(round(y))) for x, y in zip(xs, ys) if np.isfinite(x) and np.isfinite(y)]
+    for a, b in zip(points, points[1:]):
+        cv2.line(image, a, b, (255, 200, 0), 2, cv2.LINE_AA)
+    for x, y in calibration.surface:
+        cv2.circle(image, (int(round(x)), int(round(y))), 7, (255, 255, 255), 2, cv2.LINE_AA)
+
+
 def draw_calibration_still(reference_bgr, calibration, out_path: str, every: float = 1.0) -> None:
     """
     The calibration's distance lines and clicked marks, drawn on a still
@@ -107,6 +124,7 @@ def draw_calibration_still(reference_bgr, calibration, out_path: str, every: flo
     image = reference_bgr.copy()
     _draw_distance_lines(image, _distance_lines(calibration, image.shape[0], every))
     _draw_knots(image, calibration)
+    _draw_surface(image, calibration)
     cv2.imwrite(out_path, image)
     print(f"Calibration still saved to: {os.path.abspath(out_path)}")
 
@@ -157,10 +175,13 @@ def draw_overlay(
             row = rows.get(number)
             if row is not None:
                 if bool(row["found"]):
-                    x, y = int(row["box_x"]), int(row["box_y"])
-                    w, h = int(row["box_w"]), int(row["box_h"])
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), _BOX, 2)
                     cx, cy = float(row["centroid_x"]), float(row["centroid_y"])
+                    if pd.notna(row.get("box_x")):
+                        x, y = int(row["box_x"]), int(row["box_y"])
+                        w, h = int(row["box_w"]), int(row["box_h"])
+                        cv2.rectangle(frame, (x, y), (x + w, y + h), _BOX, 2)
+                    else:  # a keyframe click with no blob under it
+                        x, y, h = int(cx), int(cy), 0
                     cv2.circle(frame, (int(round(cx)), int(round(cy))), 4, _CENTROID, -1)
                     if lead_column is not None and pd.notna(row.get(lead_column)):
                         lx = int(round(float(row[lead_column])))

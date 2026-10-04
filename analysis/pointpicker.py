@@ -16,6 +16,7 @@ Controls:
     left-click      place (or move) the point
     u / backspace   clear the placed point
     r               reset the view to the whole frame
+    s, a            (keypoints) mark this one / all of them not visible
     enter           confirm and close
     escape          cancel (returns None)
     close window    same as enter
@@ -36,6 +37,15 @@ _CLICK_TOLERANCE_PX = 5
 _ZOOM_STEP = 1.3
 _MIN_VISIBLE_PX = 8.0  # don't let zoom-in go below this many image pixels across
 _MAX_VIEW_SCALE = 4.0  # don't let zoom-out go beyond this multiple of the image
+
+# What MediaPipe means by its less obvious landmark names, shown while placing them.
+_HINTS = {
+    "foot_index": "tip of the toes",
+    "heel": "back of the heel",
+    "hip": "hip joint, not the waist",
+    "ankle": "ankle joint",
+    "wrist": "wrist joint",
+}
 
 
 class _ZoomPanView:
@@ -109,6 +119,13 @@ class _ZoomPanView:
         self.ax.set_xlim(*self._home[0])
         self.ax.set_ylim(*self._home[1])
         self.fig.canvas.draw_idle()
+
+    def _start_view(self, view: Optional[Tuple[float, float, float, float]]) -> None:
+        """Open zoomed to (x0, x1, y0, y1) in image pixels; 'r' still shows the whole frame."""
+        if view is not None:
+            x0, x1, y0, y1 = view
+            self.ax.set_xlim(x0, x1)
+            self.ax.set_ylim(y1, y0)  # image rows run downwards
 
     # ---- subclass hooks ----
 
@@ -262,7 +279,7 @@ class _KeypointLabeler(_ZoomPanView):
     ground truth silently wrong wherever a limb is occluded.
     """
 
-    def __init__(self, image_bgr, names, mask=None, title="", existing=None):
+    def __init__(self, image_bgr, names, mask=None, title="", existing=None, view=None):
         if not names:
             raise ValueError("names must not be empty")
         self.names: List[str] = list(names)
@@ -270,6 +287,7 @@ class _KeypointLabeler(_ZoomPanView):
         self.index = 0
         self._artists: List = []
         super().__init__(image_bgr, mask=mask, title=title)
+        self._start_view(view)
         self._redraw()
 
     @property
@@ -295,6 +313,12 @@ class _KeypointLabeler(_ZoomPanView):
         elif event.key == "s":
             self.points[self.current] = None  # explicitly not visible
             self._advance(1)
+        elif event.key == "a":
+            for name in self.names:  # nothing to see on this frame at all
+                if self.points.get(name) is None:
+                    self.points[name] = None
+            self._finish()
+            return
         elif event.key == "enter":
             self._finish()
             return
@@ -324,12 +348,13 @@ class _KeypointLabeler(_ZoomPanView):
     def _update_title(self) -> None:
         placed = sum(1 for v in self.points.values() if v is not None)
         skipped = sum(1 for v in self.points.values() if v is None)
+        hint = _HINTS.get(self.current.split("_", 1)[-1] if "_" in self.current else self.current)
         self.ax.set_title(
             f"{self._title}\n"
-            f"[{self.index + 1}/{len(self.names)}]  now placing: {self.current}   "
-            f"({placed} placed, {skipped} skipped)\n"
-            "click=place  n/p=next/prev  s=not visible  u=clear  r=reset  "
-            "enter=done  esc=cancel",
+            f"[{self.index + 1}/{len(self.names)}]  now placing: {self.current}"
+            f"{f' ({hint})' if hint else ''}   ({placed} placed, {skipped} skipped)\n"
+            "click=place  n/p=next/prev  s=not visible  a=rest not visible, next frame  u=clear  "
+            "r=whole frame  enter=done  esc=stop",
             fontsize=9,
         )
 
@@ -358,11 +383,13 @@ def label_keypoints(
     names,
     title: str = "",
     existing: Optional[Dict[str, Optional[Point]]] = None,
+    view: Optional[Tuple[float, float, float, float]] = None,
 ) -> Optional[Dict[str, Optional[Point]]]:
     """
     Walk through `names`, placing each keypoint on image_bgr. Returns
     {name: (x, y)} for placed points, {name: None} for ones explicitly
     marked not visible, and omits names never reached. Returns None if
-    the labeller cancelled. Requires a display.
+    the labeller cancelled. `view` = (x0, x1, y0, y1) opens the window
+    zoomed to that part of the image. Requires a display.
     """
-    return _KeypointLabeler(image_bgr, names, title=title, existing=existing).run()
+    return _KeypointLabeler(image_bgr, names, title=title, existing=existing, view=view).run()

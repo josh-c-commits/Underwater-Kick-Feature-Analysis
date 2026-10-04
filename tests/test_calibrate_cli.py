@@ -191,3 +191,68 @@ def test_saved_json_records_the_frames(tmp_path, labeller):
 
 
 import re  # noqa: E402
+
+
+# ---------- the lens model, the rope and the swimmer's lane ----------
+
+@pytest.fixture
+def lens_labeller(monkeypatch):
+    """Marks 'Nm' at x = 40 + 20*N on row 80 (row 90 for a second line); rope
+    points along row 30."""
+    calls = []
+
+    def label(image, names, title="", existing=None, view=None):
+        calls.append({"names": list(names), "title": title})
+        if names[0].startswith("rope"):
+            return {name: (40.0 + 60 * i, 30.0) for i, name in enumerate(names)}
+        row = 90.0 if sum(1 for c in calls if not c["names"][0].startswith("rope")) == 2 else 80.0
+        return {name: (40 + 20 * float(name[:-1]), row) for name in names}
+
+    monkeypatch.setattr(pointpicker, "label_keypoints", label)
+    return calls
+
+
+def test_lens_and_rope_are_saved(tmp_path, lens_labeller):
+    video = floor_video(tmp_path)
+    out = tmp_path / "cal.json"
+    main(["calibrate", video, str(out), "--line", "lane", "--mark-range", "0", "12", "1",
+          "--lens-focal", "500", "--surface"])
+    cal = Calibration.load(str(out))
+    assert cal.lens is not None and cal.lens.focal == 500
+    assert len(cal.surface) == 5 and not cal.under_rope
+    assert lens_labeller[-1]["names"][0] == "rope 1"
+    assert np.isfinite(float(cal.depth(160.0, 60.0)))
+
+
+def test_under_rope_needs_two_lines(tmp_path, lens_labeller):
+    video = floor_video(tmp_path)
+    with pytest.raises(SystemExit, match="two --line"):
+        main(["calibrate", video, str(tmp_path / "cal.json"), "--line", "lane",
+              "--mark-range", "0", "12", "1", "--lens-focal", "500", "--under-rope"])
+    assert lens_labeller == [], "refused before any window opened"
+
+
+def test_under_rope_reads_between_the_lines_and_clicks_the_rope(tmp_path, lens_labeller):
+    video = floor_video(tmp_path)
+    out = tmp_path / "cal.json"
+    main(["calibrate", video, str(out), "--line", "near", "--line", "far",
+          "--mark-range", "0", "12", "1", "--lens-focal", "500", "--under-rope"])
+    cal = Calibration.load(str(out))
+    assert cal.under_rope and len(cal.surface) == 5 and len(cal.swimmer_rulers()) == 2
+
+
+def test_the_default_file_is_named_after_the_clip_and_analyze_finds_it(tmp_path, lens_labeller,
+                                                                        monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    video = floor_video(tmp_path)
+    main(["calibrate", video, "--line", "lane", "--mark-range", "0", "12", "1",
+          "--lens-focal", "500", "--surface"])
+    assert (tmp_path / "data" / "calibrations" / "floor.json").exists()
+    boxes = tmp_path / "boxes.csv"
+    rows = ["frame,found,centroid_x,centroid_y,box_w,box_h,merged"]
+    rows += [f"{f},True,{60 + 4 * f},60,30,10,False" for f in range(1, 41)]
+    boxes.write_text("\n".join(rows))
+    main(["analyze", str(boxes), str(tmp_path / "kin.csv"), "--video", video])
+    out = capsys.readouterr().out
+    assert "Using the clip's calibration" in out
+    assert '"speed_units": "m/s"' in out and "mean_depth_m" in out

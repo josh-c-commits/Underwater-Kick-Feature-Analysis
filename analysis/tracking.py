@@ -32,7 +32,8 @@ import cv2
 import numpy as np
 import pandas as pd
 
-from .frames import iter_frames, median_background
+from .frames import fps as video_fps
+from .frames import frame_size, iter_frames, median_background, stack_median
 
 BOX_COLUMNS = [
     "frame",
@@ -52,7 +53,20 @@ BOX_COLUMNS = [
     # stabilization, or when stabilization found no real camera motion
     "cam_dx",
     "cam_dy",
+    # how the row was obtained: "detected", "keyframe" (marked by hand) or "lost"
+    "source",
+    # forward and backward tracking chose different blobs here; worth reviewing
+    "conflict",
+    # blob area over the swimmer's lower-quartile area within 3 s either side
+    "size_ratio",
+    # bigger and taller than the swimmer alone: another swimmer has probably
+    # overlapped the subject and merged into the same blob (association._flag_merges)
+    "merged",
 ]
+
+# Every blob that differs from the background, per frame (see detect_candidates).
+CANDIDATE_COLUMNS = ["frame", "box_x", "box_y", "box_w", "box_h", "centroid_x", "centroid_y",
+                     "area", "edge_left", "edge_right"]
 
 
 def fixed_box(
@@ -220,6 +234,7 @@ def measure_camera_motion(
     plate_gray: np.ndarray,
     blur: int = 5,
     min_response: float = 0.5,
+    ignore_above: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Two independent measurements of where the camera is on each frame, taken
@@ -236,13 +251,19 @@ def measure_camera_motion(
         plate is featureless or smeared by steady drift.
 
     Neither is usable alone; fuse_camera_path combines their strengths.
+
+    ignore_above: rows above this are left out of both measurements. The
+    water surface moves constantly and coherently, which is exactly what
+    pulls these estimates off; the camera's motion shows just as well below it.
     """
+    top = max(0, ignore_above or 0)
+    plate_gray = plate_gray[top:]
     relative = [(0.0, 0.0)]
     absolute = []
     previous = None
     window = None
     for _, frame in iter_frames(video_path):
-        gray = _prepared_gray(frame, blur)
+        gray = _prepared_gray(frame, blur)[top:]
         if window is None:
             window = correlation_window(gray.shape)
         (ax, ay), _ = _phase_correlate(plate_gray, gray, window)
@@ -352,6 +373,7 @@ def stabilized_background(
     blur: int = 5,
     min_response: float = 0.5,
     progress: bool = False,
+    ignore_above: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     (plate, offsets): a background plate for a camera that moves, and each
@@ -364,9 +386,10 @@ def stabilized_background(
     """
     if progress:
         print("Measuring camera motion (pass 1 of 2)...")
-    plain = median_background(video_path, max_samples=max_samples)
+    top = max(0, ignore_above or 0)
+    plain = median_background(video_path, max_samples=max_samples, ignore_above=ignore_above)
     relative, absolute = measure_camera_motion(
-        video_path, _prepared_gray(plain, blur), blur, min_response
+        video_path, _prepared_gray(plain, blur), blur, min_response, ignore_above
     )
     first_path = fuse_camera_path(relative, absolute)
 
@@ -380,7 +403,8 @@ def stabilized_background(
 
     if progress:
         print(f"Building aligned background from up to {max_samples} frames...")
-    plate = aligned_background(video_path, first_path, max_samples=max_samples)
+    plate = aligned_background(video_path, first_path, max_samples=max_samples,
+                               ignore_above=ignore_above)
 
     # Refinement. The first anchor was measured against the plain median, which
     # drift smears -- and matching against a smeared image pulls every estimate
@@ -391,10 +415,10 @@ def stabilized_background(
     # and the worst case from 5.3px to 2.9px.
     if progress:
         print("Measuring camera motion (pass 2 of 2)...")
-    plate_gray = _prepared_gray(plate, blur)
+    plate_gray = _prepared_gray(plate, blur)[top:]
     window = correlation_window(plate_gray.shape)
     refined_absolute = np.asarray(
-        [_phase_correlate(plate_gray, _prepared_gray(frame, blur), window)[0]
+        [_phase_correlate(plate_gray, _prepared_gray(frame, blur)[top:], window)[0]
          for _, frame in iter_frames(video_path)],
         dtype=float,
     )
@@ -409,6 +433,7 @@ def aligned_background(
     home: Optional[Tuple[float, float]] = None,
     start_frame: int = 1,
     end_frame: Optional[int] = None,
+    ignore_above: Optional[int] = None,
 ) -> np.ndarray:
     """
     Background plate built from frames shifted back into register first.
@@ -430,25 +455,31 @@ def aligned_background(
     start_frame/end_frame: build from part of the clip only (1-indexed,
     inclusive). Together these give a calibration reference from just the
     frames where markers were down, in the same coordinates tracking uses.
+    ignore_above: as in frames.median_background.
     """
     last = len(path) if end_frame is None else min(end_frame, len(path))
     stride = max(1, (last - start_frame + 1) // max_samples)
+    expected = min(max_samples, len(range(start_frame, last + 1, stride)))
     home = np.median(path, axis=0) if home is None else np.asarray(home, dtype=float)
-    samples = []
+    top = max(0, ignore_above or 0)
+    plate, stack, count = None, None, 0
     for number, frame in iter_frames(video_path, start_frame, last, stride):
         dx, dy = path[number - 1] - home
-        if np.hypot(dx, dy) < min_align:
-            samples.append(frame)
-        else:
+        if np.hypot(dx, dy) >= min_align:
             height, width = frame.shape[:2]
             matrix = np.float32([[1.0, 0.0, -dx], [0.0, 1.0, -dy]])
-            samples.append(cv2.warpAffine(frame, matrix, (width, height),
-                                          borderMode=cv2.BORDER_REFLECT))
-        if len(samples) >= max_samples:
+            frame = cv2.warpAffine(frame, matrix, (width, height), borderMode=cv2.BORDER_REFLECT)
+        if stack is None:
+            plate = frame.copy()
+            stack = np.empty((max(expected, 1),) + frame[top:].shape, dtype=np.uint8)
+        if count == len(stack):
             break
-    if not samples:
+        stack[count] = frame[top:]
+        count += 1
+    if not count:
         raise RuntimeError(f"No frames could be read from {video_path}.")
-    return np.median(np.stack(samples), axis=0).astype(np.uint8)
+    plate[top:] = stack_median(stack[:count])
+    return plate
 
 
 def calibration_reference(
@@ -457,6 +488,7 @@ def calibration_reference(
     stabilize: bool = False,
     max_samples: int = 120,
     progress: bool = False,
+    ignore_above: Optional[int] = None,
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """
     (reference, plate): the image calibration marks are clicked on, and the
@@ -471,26 +503,29 @@ def calibration_reference(
     """
     if stabilize:
         plate, offsets = stabilized_background(video_path, max_samples=max_samples,
-                                               progress=progress)
+                                               progress=progress, ignore_above=ignore_above)
         if frames is None:
             return plate, plate
         if progress:
             print(f"Building the reference from frames {frames[0]}-{frames[1]}...")
         reference = aligned_background(video_path, offsets, max_samples=max_samples,
                                        home=(0.0, 0.0), start_frame=frames[0],
-                                       end_frame=frames[1])
+                                       end_frame=frames[1], ignore_above=ignore_above)
         return reference, plate
     if frames is None:
         if progress:
             print(f"Building a median reference image from {max_samples} frames...")
-        reference = median_background(video_path, max_samples=max_samples)
+        reference = median_background(video_path, max_samples=max_samples,
+                                      ignore_above=ignore_above)
         return reference, reference
     if progress:
         print(f"Building the reference from frames {frames[0]}-{frames[1]}...")
-    return median_background(video_path, max_samples, frames[0], frames[1]), None
+    return median_background(video_path, max_samples, frames[0], frames[1], ignore_above), None
 
 
-def plate_offset(image: np.ndarray, plate: np.ndarray, blur: int = 5) -> Optional[Tuple[float, float]]:
+def plate_offset(
+    image: np.ndarray, plate: np.ndarray, blur: int = 5, ignore_above: Optional[int] = None
+) -> Optional[Tuple[float, float]]:
     """
     (dx, dy) of `image` relative to `plate`, or None when it can't be measured
     (too little texture, or the tiles disagree).
@@ -500,8 +535,9 @@ def plate_offset(image: np.ndarray, plate: np.ndarray, blur: int = 5) -> Optiona
     removed offsets every clicked mark by the same amount, and nothing
     downstream would notice.
     """
+    top = max(0, ignore_above or 0)
     dx, dy, _ = estimate_translation_consensus(
-        _prepared_gray(image, blur), _prepared_gray(plate, blur)
+        _prepared_gray(image, blur)[top:], _prepared_gray(plate, blur)[top:]
     )
     if not np.isfinite(dx):
         return None
@@ -548,6 +584,7 @@ def _binary_diff(
     sigma: float,
     camera: Optional[Tuple[float, float]] = None,
     min_shift: float = 2.5,
+    kernel_size: int = 5,
 ) -> np.ndarray:
     """Foreground mask for one frame, given the camera's offset from the plate
     when stabilizing (None when the camera is taken as fixed)."""
@@ -596,35 +633,46 @@ def _binary_diff(
         threshold = int(median + sigma * max(mad, 1.0))
 
     _, binary = cv2.threshold(diff, threshold, 255, cv2.THRESH_BINARY)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
     return binary
 
 
-def suggest_roi(video_path: str, max_samples: int = 60, quantile: float = 0.75) -> Tuple[int, int]:
+def suggest_roi(
+    video_path: str,
+    max_samples: int = 60,
+    busy_ratio: float = 4.0,
+    ignore_above: Optional[int] = None,
+) -> Tuple[int, int]:
     """
     Report the rows worth searching, by measuring how much each image row
     moves across the clip.
 
-    Static structure (pool floor, walls) barely changes; a swaying lane rope
-    changes constantly in every frame; the swimmer only disturbs a few columns
-    at a time, so it contributes little to a row's average. Rows above
-    `quantile` of the row-energy distribution are therefore rope-like and get
-    excluded, and the largest surviving contiguous band is returned.
+    A swaying lane rope or the water surface moves across its whole row in
+    every frame; the swimmer covers a few columns of theirs. So each row's
+    motion is the *median* change across its columns, which a swimmer-sized
+    minority of columns can't move. Rows more than `busy_ratio` times busier
+    than a typical row are rope-like and excluded, and the largest calm band
+    left is returned. (A mean across columns, as before, let a swimmer on 4K
+    footage -- a tenth of the frame's width for most of the clip -- push their
+    own rows out of the band.) Rows above `ignore_above` are never part of it.
     """
-    background = median_background(video_path, max_samples=max_samples)
+    background = median_background(video_path, max_samples=max_samples,
+                                   ignore_above=ignore_above)
     background_gray = cv2.cvtColor(background, cv2.COLOR_BGR2GRAY)
 
     energies = []
     for _, frame in iter_frames(video_path, stride=max(1, 300 // max_samples)):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        energies.append(cv2.absdiff(gray, background_gray).mean(axis=1))
+        energies.append(np.median(cv2.absdiff(gray, background_gray), axis=1))
         if len(energies) >= max_samples:
             break
 
     row_energy = np.mean(np.stack(energies), axis=0)
-    cutoff = float(np.quantile(row_energy, quantile))
+    top = max(0, ignore_above or 0)
+    cutoff = busy_ratio * max(float(np.median(row_energy[top:])), 1.0)
+    row_energy[:top] = np.inf
 
     best, current = (0, 0), None
     for y, value in enumerate(row_energy):
@@ -637,30 +685,21 @@ def suggest_roi(video_path: str, max_samples: int = 60, quantile: float = 0.75) 
     return best
 
 
-def _pick_component(
+def frame_candidates(
     binary: np.ndarray,
     min_area: int,
-    roi: Optional[Tuple[int, int]],
-    predicted: Optional[Tuple[float, float]],
-    max_jump: float,
-    area_reference: Optional[float],
-    max_area_ratio: float,
-    min_area_ratio: float,
+    roi: Optional[Tuple[int, int]] = None,
     edge_percentile: float = 98.0,
-):
+) -> List[dict]:
     """
-    Return a dict describing the chosen blob -- box, centroid, area, and
-    robust left/right edges -- or None if nothing passes the gates.
+    Every blob in one frame's foreground mask that is big enough to matter:
+    its box, centroid, area, and robust left/right edges.
 
-    Returning None matters more than it looks. The obvious fallback --
-    "take the biggest blob instead" -- is precisely how a tracker hops
-    onto a swimmer in the next lane when the two cross, and it does so
-    silently. Reporting the frame as lost keeps that failure visible
-    instead of quietly corrupting every downstream measurement.
+    Which of them is the swimmer is decided later (association.associate), with
+    the whole clip and the keyframes in view.
     """
     count, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
-
-    candidates = []
+    blobs = []
     for i in range(1, count):  # 0 is the background label
         area = int(stats[i, cv2.CC_STAT_AREA])
         if area < min_area:
@@ -668,89 +707,66 @@ def _pick_component(
         cx, cy = float(centroids[i][0]), float(centroids[i][1])
         if roi is not None and not (roi[0] <= cy <= roi[1]):
             continue
-        # A blob several times the size of the one we've been following is a
-        # different object, however close it happens to be right now. The two
-        # bounds guard against different things: the upper one blocks
-        # defection to a bigger (nearer) swimmer; the lower one rejects body
-        # *fragments* -- an arm or the legs detected on their own, whose centroid
-        # sits well off the body's. Measured, loosening it from 1/3 to 1/4 only
-        # admitted detections a median 20px from the swimmer's true path, and
-        # 1/5 derailed tracking on drifting footage (83 frames lost, not gained).
-        if area_reference is not None:
-            ratio = area / area_reference
-            if ratio > max_area_ratio or ratio < min_area_ratio:
-                continue
-        box = (
-            int(stats[i, cv2.CC_STAT_LEFT]),
-            int(stats[i, cv2.CC_STAT_TOP]),
-            int(stats[i, cv2.CC_STAT_WIDTH]),
-            int(stats[i, cv2.CC_STAT_HEIGHT]),
-        )
-        candidates.append((box, (cx, cy), area, i))
-
-    if not candidates:
-        return None
-    if predicted is None:
-        chosen = max(candidates, key=lambda c: c[2])
-    else:
-        px, py = predicted
-        chosen = min(candidates, key=lambda c: np.hypot(c[1][0] - px, c[1][1] - py))
-        if np.hypot(chosen[1][0] - px, chosen[1][1] - py) > max_jump:
-            return None
-
-    (x, y, w, h), centroid, area, label = chosen
-    # Percentiles of the blob's pixel columns rather than its extreme columns:
-    # the box edge is set by the single outermost pixel, so it jumps with any
-    # ripple that happens to touch the silhouette's boundary.
-    columns = np.nonzero(labels[y:y + h, x:x + w] == label)[1] + x
-    left, right = np.percentile(columns, [100.0 - edge_percentile, edge_percentile])
-    return {"box": (x, y, w, h), "centroid": centroid, "area": area,
-            "edges": (float(left), float(right))}
+        x, y = int(stats[i, cv2.CC_STAT_LEFT]), int(stats[i, cv2.CC_STAT_TOP])
+        w, h = int(stats[i, cv2.CC_STAT_WIDTH]), int(stats[i, cv2.CC_STAT_HEIGHT])
+        # Percentiles of the blob's pixel columns rather than its extreme columns:
+        # the box edge is set by the single outermost pixel, so it jumps with any
+        # ripple that happens to touch the silhouette's boundary.
+        columns = np.nonzero(labels[y:y + h, x:x + w] == i)[1] + x
+        left, right = np.percentile(columns, [100.0 - edge_percentile, edge_percentile])
+        blobs.append({"box_x": x, "box_y": y, "box_w": w, "box_h": h, "centroid_x": cx,
+                      "centroid_y": cy, "area": area, "edge_left": float(left),
+                      "edge_right": float(right)})
+    return blobs
 
 
-def detect_boxes(
+def _odd(value: float) -> int:
+    return max(1, int(round(value)) // 2 * 2 + 1)
+
+
+def detect_candidates(
     video_path: str,
     background: Optional[np.ndarray] = None,
     roi: Optional[Tuple[int, int]] = None,
-    seed_point: Optional[Tuple[int, int]] = None,
-    min_area: int = 80,
+    min_area: Optional[int] = None,
     threshold: Optional[int] = None,
     sigma: float = 6.0,
-    max_jump: float = 60.0,
-    max_area_ratio: float = 3.0,
-    min_area_ratio: float = 1.0 / 3.0,
-    area_anchor_samples: int = 15,
     edge_percentile: float = 98.0,
-    max_radius_factor: float = 4.0,
     stabilize: bool = False,
     min_response: float = 0.5,
     min_shift: float = 2.5,
-    blur: int = 5,
+    blur: Optional[int] = None,
     max_samples: int = 120,
     progress: bool = True,
-) -> pd.DataFrame:
+    ignore_above: Optional[int] = None,
+) -> Tuple[pd.DataFrame, np.ndarray]:
     """
-    One row per video frame: the detected box, blob centroid and area,
-    with found=False on frames where nothing plausible was seen.
+    (candidates, camera): every blob that differs from the background in every
+    frame (CANDIDATE_COLUMNS), and each frame's camera offset, shape (n, 2).
 
     roi: (y_min, y_max) band to search, which is the main defence against
     locking onto a swaying lane rope -- see suggest_roi(). It gates the
-    threshold calculation too, not just candidate selection.
+    threshold calculation too, not just which blobs are kept.
     sigma: threshold in robust deviations (MAD) above the ROI's median
     difference. Lower it if the swimmer is being missed, raise it if
     ripple is being picked up.
-    max_jump: how far (px) the centroid may move between frames before
-    the match is treated as implausible.
     stabilize: compensate camera drift by phase-correlating each frame
     against the background plate before differencing. Background
     subtraction assumes a fixed camera; without this, a camera that
     wanders even 25px turns every high-contrast edge in the scene --
     lane ropes, floor lines, tile borders -- into false motion.
-    seed_point: (x, y) on frame 1 identifying *which* swimmer to follow.
-    Without it the largest blob wins, which on any footage with more
-    than one lane occupied is usually the wrong person -- whoever is
-    nearest the camera looks biggest. Strongly recommended.
+    ignore_above: rows above this are never searched, and are left out of the
+    background plate and camera-motion measurement -- for the water surface,
+    whose constant motion is noise with nothing stable in it.
+    min_area, blur: default to values tuned at 1920 px wide, scaled up for
+    larger frames, so specks of ripple at 4K aren't taken for blobs.
     """
+    width, _ = frame_size(video_path)
+    scale = max(1.0, width / 1920.0)
+    blur = blur if blur is not None else _odd(5 * scale)
+    min_area = min_area if min_area is not None else int(round(80 * scale ** 2))
+    kernel_size = _odd(5 * scale)
+
     offsets = None
     if stabilize:
         if background is not None:
@@ -759,26 +775,21 @@ def detect_boxes(
                 "from the estimated camera path, or offsets and plate won't agree."
             )
         background, offsets = stabilized_background(
-            video_path, max_samples, blur, min_response, progress
+            video_path, max_samples, blur, min_response, progress, ignore_above
         )
     if background is None:
         if progress:
             print(f"Building median background from up to {max_samples} frames...")
-        background = median_background(video_path, max_samples=max_samples)
+        background = median_background(video_path, max_samples=max_samples,
+                                       ignore_above=ignore_above)
+    if ignore_above:
+        top = int(ignore_above)
+        roi = (max(roi[0], top), roi[1]) if roi is not None else (top, background.shape[0])
     background_gray = cv2.cvtColor(background, cv2.COLOR_BGR2GRAY)
     if blur > 1:
         background_gray = cv2.GaussianBlur(background_gray, (blur | 1, blur | 1), 0)
 
-
-    rows = []
-    predicted: Optional[Tuple[float, float]] = (
-        (float(seed_point[0]), float(seed_point[1])) if seed_point else None
-    )
-    previous: Optional[Tuple[float, float]] = None
-    velocity = (0.0, 0.0)
-    early_areas: List[float] = []
-    coasting = 0
-
+    rows, camera_path_ = [], []
     for number, frame in iter_frames(video_path):
         if offsets is not None and number - 1 < len(offsets):
             cam_dx, cam_dy = float(offsets[number - 1][0]), float(offsets[number - 1][1])
@@ -786,60 +797,100 @@ def detect_boxes(
         else:
             cam_dx, cam_dy, camera = 0.0, 0.0, None
         binary = _binary_diff(frame, background_gray, threshold, blur, roi, sigma,
-                              camera=camera, min_shift=min_shift)
-        # Anchored to the first few accepted areas, never a rolling window. A
-        # rolling reference drifts: each slightly-larger blob shifts the median,
-        # which admits a larger one still, and the gate walks itself onto a
-        # different swimmer a few frames at a time.
-        area_reference = (
-            float(np.median(early_areas)) if len(early_areas) >= area_anchor_samples else None
+                              camera=camera, min_shift=min_shift, kernel_size=kernel_size)
+        for blob in frame_candidates(binary, min_area, roi, edge_percentile):
+            rows.append({"frame": number, **blob})
+        camera_path_.append((cam_dx, cam_dy))
+    return pd.DataFrame(rows, columns=CANDIDATE_COLUMNS), np.asarray(camera_path_, dtype=float)
+
+
+def boxes_from_candidates(
+    blobs: pd.DataFrame,
+    camera: np.ndarray,
+    fps: float,
+    width: int,
+    keyframes=(),
+    motion=None,
+    max_area_ratio: float = 3.0,
+    min_area_ratio: float = 1.0 / 3.0,
+) -> pd.DataFrame:
+    """Association on already-detected candidates, as a BOX_COLUMNS table. Shared
+    by detect_boxes and the reviewer, which reruns it after every keyframe edit."""
+    from .association import associate
+
+    table = associate(blobs, len(camera), fps, keyframes, motion, max_area_ratio,
+                      min_area_ratio, default_length=0.05 * width)
+    table["cam_dx"], table["cam_dy"] = camera[:, 0], camera[:, 1]
+    table = table.reindex(columns=BOX_COLUMNS)
+    table["area"] = table["area"].fillna(0)
+    return table
+
+
+def candidates_path(boxes_csv: str) -> str:
+    """Where `track` keeps the candidates behind a boxes table, for the reviewer."""
+    return os.path.splitext(boxes_csv)[0] + "_candidates.csv"
+
+
+def detect_boxes(
+    video_path: str,
+    background: Optional[np.ndarray] = None,
+    roi: Optional[Tuple[int, int]] = None,
+    seed_point: Optional[Tuple[float, float]] = None,
+    keyframes=None,
+    min_area: Optional[int] = None,
+    threshold: Optional[int] = None,
+    sigma: float = 6.0,
+    max_area_ratio: float = 3.0,
+    min_area_ratio: float = 1.0 / 3.0,
+    edge_percentile: float = 98.0,
+    stabilize: bool = False,
+    min_response: float = 0.5,
+    min_shift: float = 2.5,
+    blur: Optional[int] = None,
+    max_samples: int = 120,
+    progress: bool = True,
+    ignore_above: Optional[int] = None,
+    motion=None,
+    candidates: Optional[Tuple[pd.DataFrame, np.ndarray]] = None,
+) -> pd.DataFrame:
+    """
+    One row per video frame (BOX_COLUMNS): the swimmer's box, centroid and
+    area, with found=False on frames where nothing plausible was seen.
+
+    Detection (detect_candidates, see its arguments) finds every moving blob;
+    association.associate then decides which is the swimmer, following them
+    forwards and backwards from each keyframe.
+
+    keyframes: association.Keyframe list marking the swimmer (or their
+    absence) on any frames. seed_point: (x, y) on frame 1, a shorthand for one
+    keyframe there. Without either, the largest blob wins, which on footage
+    with more than one lane occupied is usually the wrong person -- whoever
+    is nearest the camera looks biggest. Strongly recommended.
+    max_area_ratio / min_area_ratio: blobs more than this many times bigger or
+    smaller than the swimmer at the keyframe are someone else, or a fragment.
+    candidates: detect_candidates' output, to re-associate without reading
+    the video again.
+    """
+    from .association import Keyframe
+
+    if candidates is None:
+        candidates = detect_candidates(
+            video_path, background, roi, min_area, threshold, sigma, edge_percentile,
+            stabilize, min_response, min_shift, blur, max_samples, progress, ignore_above,
         )
-        # The search radius widens the longer the swimmer has been missing, so
-        # re-acquisition stays local. Falling back to "largest blob anywhere"
-        # lets the box teleport across the frame onto another lane entirely.
-        radius = max_jump * min(1.0 + coasting, max_radius_factor)
-        hit = _pick_component(
-            binary, min_area, roi, predicted, radius, area_reference,
-            max_area_ratio, min_area_ratio, edge_percentile,
-        )
-
-        if hit is None:
-            # The camera offset is still recorded on lost frames: the camera
-            # moved whether or not the swimmer was found, and an overlay drawn
-            # on this frame needs to know where the pool is.
-            rows.append({"frame": number, "found": False, "box_x": None, "box_y": None,
-                         "box_w": None, "box_h": None, "centroid_x": None,
-                         "centroid_y": None, "area": 0, "edge_left": None,
-                         "edge_right": None, "cam_dx": cam_dx, "cam_dy": cam_dy})
-            # Coast on the last known velocity for a few frames: a swimmer
-            # briefly occluded (bubbles, a crossing swimmer) is still where
-            # physics says they are, so re-acquisition should find them.
-            coasting += 1
-            previous = None  # velocity estimate across a gap is meaningless
-            if predicted is not None:
-                # Coast forward, but decay the velocity: a stale motion estimate
-                # shouldn't keep flinging the search window down the pool.
-                velocity = (velocity[0] * 0.8, velocity[1] * 0.8)
-                predicted = (predicted[0] + velocity[0], predicted[1] + velocity[1])
-            continue
-
-        (bx, by, bw, bh), (cx, cy), area = hit["box"], hit["centroid"], hit["area"]
-        rows.append({"frame": number, "found": True, "box_x": bx, "box_y": by,
-                     "box_w": bw, "box_h": bh, "centroid_x": cx,
-                     "centroid_y": cy, "area": area, "edge_left": hit["edges"][0],
-                     "edge_right": hit["edges"][1], "cam_dx": cam_dx, "cam_dy": cam_dy})
-
-        velocity = (cx - previous[0], cy - previous[1]) if previous else (0.0, 0.0)
-        predicted = (cx + velocity[0], cy + velocity[1])
-        previous = (cx, cy)
-        coasting = 0
-        if len(early_areas) < area_anchor_samples:
-            early_areas.append(float(area))
-
-    table = pd.DataFrame(rows, columns=BOX_COLUMNS)
+    blobs, camera = candidates
+    keys = list(keyframes or [])
+    if seed_point is not None and not any(k.frame == 1 for k in keys):
+        keys.append(Keyframe(1, float(seed_point[0]), float(seed_point[1])))
+    width, _ = frame_size(video_path)
+    table = boxes_from_candidates(blobs, camera, video_fps(video_path), width, keys, motion,
+                                  max_area_ratio, min_area_ratio)
     if progress:
         found = int(table["found"].sum())
-        print(f"Tracked {found}/{len(table)} frames ({found / max(len(table), 1):.0%}).")
+        conflicts = int(table["conflict"].sum())
+        print(f"Tracked {found}/{len(table)} frames ({found / max(len(table), 1):.0%})"
+              + (f"; {conflicts} frames where forward and backward tracking disagreed."
+                 if conflicts else "."))
     return table
 
 

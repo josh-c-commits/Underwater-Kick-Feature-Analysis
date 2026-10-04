@@ -132,26 +132,65 @@ def sample_frames(
     return [frame for _, frame in iter_frames(video_path, start_frame, last, stride)][:max_samples]
 
 
+def stack_median(stack: np.ndarray, rows_per_strip: int = 64) -> np.ndarray:
+    """
+    Per-pixel median over the first axis of an (n, h, w[, c]) uint8 stack,
+    computed a strip of rows at a time.
+
+    np.median over the whole stack makes a full sorted copy of it. Working in
+    strips keeps that copy small, so the peak memory is about the stack itself:
+    120 samples of 4K is ~3GB this way, against ~9GB building a list of frames,
+    stacking it and taking the median in one go.
+    """
+    out = np.empty(stack.shape[1:], dtype=np.uint8)
+    for row in range(0, stack.shape[1], rows_per_strip):
+        out[row:row + rows_per_strip] = np.median(stack[:, row:row + rows_per_strip], axis=0)
+    return out
+
+
 def median_background(
     video_path: str,
     max_samples: int = 120,
     start_frame: int = 1,
     end_frame: Optional[int] = None,
+    ignore_above: Optional[int] = None,
 ) -> np.ndarray:
     """
     Per-pixel median across frames spread over the clip: a static
     background plate with moving things (swimmer, ripple) removed.
 
-    max_samples trades accuracy for memory and time -- every sample is
-    held in RAM at once, so 120 frames of 1624x320 is ~180MB, while a
-    1080p clip would want a much lower number.
+    max_samples trades accuracy for memory and time. Samples are held in one
+    preallocated array, so memory is roughly max_samples frames: ~25MB each
+    at 4K, ~6MB at 1080p.
 
     start_frame/end_frame restrict it to part of the clip -- e.g. the few
     seconds when calibration markers were on the pool floor. Over the whole
     clip those markers would vanish from the median like anything else that
     isn't there most of the time.
+
+    ignore_above: rows above this are left out of the median and copied from
+    the first sample instead -- for a region nothing should be measured in,
+    such as the water surface. It also cuts memory in proportion.
     """
-    samples = sample_frames(video_path, max_samples, start_frame, end_frame)
-    if not samples:
+    total = frame_count(video_path)
+    if total > 0:
+        last = total if end_frame is None else min(end_frame, total)
+        stride = max(1, (last - start_frame + 1) // max_samples)
+        expected = min(max_samples, len(range(start_frame, last + 1, stride)))
+    else:  # some containers don't report a frame count; read from the start
+        last, stride, expected = end_frame, 1, max_samples
+    top = max(0, ignore_above or 0)
+
+    plate, stack, count = None, None, 0
+    for _, frame in iter_frames(video_path, start_frame, last, stride):
+        if stack is None:
+            plate = frame.copy()
+            stack = np.empty((max(expected, 1),) + frame[top:].shape, dtype=np.uint8)
+        if count == len(stack):
+            break
+        stack[count] = frame[top:]
+        count += 1
+    if not count:
         raise RuntimeError(f"No frames could be read from {video_path}.")
-    return np.median(np.stack(samples), axis=0).astype(np.uint8)
+    plate[top:] = stack_median(stack[:count])
+    return plate

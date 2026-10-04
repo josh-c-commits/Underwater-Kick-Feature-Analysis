@@ -102,3 +102,25 @@ def test_median_background_over_part_of_the_clip(tmp_path):
     assert median_background(path, max_samples=40)[60, 70].mean() > 150
     assert median_background(path, 40, start_frame=1, end_frame=10)[60, 70].mean() < 60
     assert median_background(path, 40, start_frame=11)[60, 70].mean() > 150
+
+
+from analysis.frames import stack_median  # noqa: E402
+
+
+def test_strip_median_matches_numpy_exactly():
+    stack = np.random.default_rng(0).integers(0, 256, (17, 130, 40, 3), dtype=np.uint8)
+    expected = np.median(stack, axis=0).astype(np.uint8)
+    assert np.array_equal(stack_median(stack, rows_per_strip=16), expected)
+
+
+def test_ignored_rows_are_copied_from_the_first_sample(tmp_path):
+    frames = []
+    for i in range(20):
+        frame = np.full((120, 160, 3), 200, dtype=np.uint8)
+        frame[:40] = 10 * i  # a "surface" that changes every frame
+        frames.append(frame)
+    path = write_video(tmp_path / "surface.mp4", frames)
+    plate = median_background(path, max_samples=20, ignore_above=40)
+    first = median_background(path, max_samples=1)
+    assert np.array_equal(plate[:40], first[:40]), "ignored rows come from the first sample"
+    assert abs(int(plate[80, 80, 0]) - 200) <= 8, "the rest is still the median (codec noise aside)"

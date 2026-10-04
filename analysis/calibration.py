@@ -40,17 +40,44 @@ for the part of the pool that was never calibrated.
 Dense marks also check each other. bend_report() uses them to measure how far
 the lens bends the scale, how well interpolation between marks holds up, and
 which mark, if any, looks mis-clicked.
+
+The lens model
+--------------
+For clips whose lens is known (lens.py: the iPhone 0.5x behind its flat window
+underwater), the refraction is undone first, and then no interpolation is
+needed: through an ideal camera, distance X along a straight pool line and
+image position u relate exactly by X = (p0 + p1 u) / (1 + p2 u). Three numbers
+per line, fitted to all its marks at once, so click errors average out, a
+mis-click stands out against the fit, and readings stay right beyond the
+outermost marks. Sparse marks are enough: the pool's own floor lines, 9 ft
+apart, crossing the floor line the swimmer swam along.
+
+That line sits at the swimmer's distance from the camera, so its ruler reads
+the swimmer directly. A level, square-on camera sees the swimmer's vertical
+plane at a single scale, the same horizontally and vertically, so the ruler's
+metres-per-pixel also converts vertical pixels: depth below the surface is the
+height of the swimmer below the lane rope (which floats on the surface), in
+those units. The floor's own depth never enters -- a floor that dips moves its
+lines up or down in the picture, not sideways -- which matters because pool
+floors slope and nobody measures them. With `under_rope` the swimmer swam
+directly beneath the rope: two lane lines are clicked, one either side, and the
+swimmer is read halfway between them, with the rope at exactly their distance.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-CALIBRATION_VERSION = 1
+from .lens import FlatPort
+
+# 2 added the lens model, the surface (lane rope) and the swimmer's-lane options;
+# version 1 files still load and work as before.
+CALIBRATION_VERSION = 2
 
 
 @dataclass
@@ -117,6 +144,19 @@ class Calibration:
     # (first, last) frames the reference image was built from, when markers
     # were only down for part of the clip; None means the whole clip.
     frames: Optional[Tuple[int, int]] = None
+    # The lens model (see the module docstring). Without one, marks are
+    # interpolated as described above.
+    lens: Optional[FlatPort] = None
+    # Points clicked along the lane rope, which floats on the surface: the
+    # reference for depth, and for which way is level.
+    surface: List[Tuple[float, float]] = field(default_factory=list)
+    # The swimmer swam directly beneath the rope, between the first two lines.
+    under_rope: bool = False
+    # How much nearer the camera the rope is than the swimmer (m), and how deep
+    # the camera was (m): together they correct depth for the rope not being at
+    # the swimmer's distance. 0 = assume it is.
+    rope_offset: float = 0.0
+    camera_depth: float = 0.5
 
     # ---- persistence ----
 
@@ -128,6 +168,11 @@ class Calibration:
             "notes": self.notes,
             "reference": self.reference,
             "frames": list(self.frames) if self.frames else None,
+            "lens": self.lens.to_dict() if self.lens else None,
+            "surface": [list(point) for point in self.surface],
+            "under_rope": self.under_rope,
+            "rope_offset": self.rope_offset,
+            "camera_depth": self.camera_depth,
             "lines": [
                 {
                     "name": line.name,
@@ -143,10 +188,10 @@ class Calibration:
     @classmethod
     def from_dict(cls, data: Dict) -> "Calibration":
         version = data.get("version")
-        if version != CALIBRATION_VERSION:
+        if version not in (1, CALIBRATION_VERSION):
             raise ValueError(
                 f"Unsupported calibration version {version!r} "
-                f"(this build writes and reads version {CALIBRATION_VERSION})."
+                f"(this build reads versions 1 and {CALIBRATION_VERSION})."
             )
         lines = [
             ReferenceLine(
@@ -167,6 +212,11 @@ class Calibration:
             notes=data.get("notes", ""),
             reference=data.get("reference", "median"),
             frames=(int(frames[0]), int(frames[1])) if frames else None,
+            lens=FlatPort.from_dict(data["lens"]) if data.get("lens") else None,
+            surface=[(float(x), float(y)) for x, y in data.get("surface", [])],
+            under_rope=bool(data.get("under_rope", False)),
+            rope_offset=float(data.get("rope_offset", 0.0)),
+            camera_depth=float(data.get("camera_depth", 0.5)),
         )
 
     def save(self, path: str) -> None:
@@ -192,6 +242,8 @@ class Calibration:
         usable = [line for line in self.lines if len(line.knots) >= 2]
         if not usable:
             raise ValueError("Calibration has no reference line with at least 2 knots.")
+        if self.lens is not None:
+            return float(self._lens_world_x(image_x, image_y))
 
         values, ys = [], []
         for line in usable:
@@ -221,6 +273,8 @@ class Calibration:
         standoff, and no assumptions -- just the same mark clicked on both
         ropes. Returns NaN if fewer than two lines cover this column.
         """
+        if self.lens is not None:
+            return float("nan")  # the lens model reads the swimmer's own lane line
         values = [
             line.world_x_at(image_x)
             for line in self.lines
@@ -253,6 +307,8 @@ class Calibration:
         point of drawing it: on a tilted camera the real pool markings lean while
         the held segments stay vertical, so the gap between them is visible.
         """
+        if self.lens is not None:
+            return self._lens_isoline(world_x, frame_height)
         points = []
         for line in self.lines:
             if len(line.knots) < 2:
@@ -277,6 +333,199 @@ class Calibration:
         if not spans:
             raise ValueError("Calibration has no reference line with at least 2 knots.")
         return (float(min(s[0] for s in spans)), float(max(s[-1] for s in spans)))
+
+
+    # ---- the lens model ----
+
+    def roll(self) -> float:
+        """Radians the (undistorted) lane rope leans: the camera's leftover roll.
+        0 without a surface."""
+        if self.lens is None or len(self.surface) < 2:
+            return 0.0
+        xs, ys = self.lens.undistort(*np.array(self.surface, dtype=float).T)
+        return float(np.arctan(np.polyfit(xs, ys, 1)[0]))
+
+    def ideal(self, image_x, image_y) -> Tuple[np.ndarray, np.ndarray]:
+        """Image points -> an ideal, level camera's coordinates: the lens undone,
+        then turned so the surface is horizontal."""
+        ux, uy = self.lens.undistort(image_x, image_y)
+        angle = -self.roll()
+        if angle:
+            dx, dy = ux - self.lens.cx, uy - self.lens.cy
+            c, s = np.cos(angle), np.sin(angle)
+            ux, uy = self.lens.cx + c * dx - s * dy, self.lens.cy + s * dx + c * dy
+        return ux, uy
+
+    def _from_ideal(self, ux, uy) -> Tuple[np.ndarray, np.ndarray]:
+        angle = self.roll()
+        if angle:
+            dx, dy = ux - self.lens.cx, uy - self.lens.cy
+            c, s = np.cos(angle), np.sin(angle)
+            ux, uy = self.lens.cx + c * dx - s * dy, self.lens.cy + s * dx + c * dy
+        return self.lens.distort(ux, uy)
+
+    def ruler(self, line: ReferenceLine) -> "Ruler":
+        xs, ys, ws = line.arrays()
+        ux, _ = self.ideal(xs, ys)
+        width = (self.frame_size[0] if self.frame_size else 2 * self.lens.cx)
+        edge_x, _ = self.ideal(np.array([0.0, width]), np.array([self.lens.cy, self.lens.cy]))
+        return Ruler.fit(ux, ws, span=(float(min(edge_x)), float(max(edge_x))))
+
+    def swimmer_rulers(self) -> List["Ruler"]:
+        usable = [line for line in self.lines if len(line.knots) >= 2]
+        return [self.ruler(line) for line in usable[:2 if self.under_rope else 1]]
+
+    def _lens_world_x(self, image_x, image_y):
+        ux, _ = self.ideal(image_x, image_y)
+        return np.mean([ruler(ux) for ruler in self.swimmer_rulers()], axis=0)
+
+    def metres_per_px(self, image_x, image_y):
+        """The scale at the swimmer's distance, the same horizontally and
+        vertically for a square-on camera."""
+        ux, _ = self.ideal(image_x, image_y)
+        return np.abs(np.mean([ruler.slope(ux) for ruler in self.swimmer_rulers()], axis=0))
+
+    def swimmer_distance(self) -> float:
+        """How far the swimmer's lane is from the camera (m), from the ruler's
+        scale and the lens's focal length."""
+        ruler = self.swimmer_rulers()[0]
+        middle = float(np.mean(ruler.u))
+        scales = [abs(r.slope(middle)) for r in self.swimmer_rulers()]
+        return float(np.mean(scales) * self.lens.ideal_focal)
+
+    def depth(self, image_x, image_y):
+        """
+        Depth below the water surface (m) of image points on the swimmer: their
+        height below the lane rope in the level ideal image, in the ruler's
+        metres-per-pixel. NaN without a lens model and a surface.
+
+        The rope floats at the surface but may not be at the swimmer's distance;
+        rope_offset (how much nearer it is, m) with camera_depth corrects for
+        that: from below, a nearer stretch of surface appears higher, by
+        camera_depth * (distance ratio - 1) once scaled.
+        """
+        image_x = np.asarray(image_x, dtype=float)
+        if self.lens is None or len(self.surface) < 2:
+            return np.full(image_x.shape, np.nan)
+        ux, uy = self.ideal(image_x, image_y)
+        sx, sy = self.ideal(*np.array(self.surface, dtype=float).T)
+        surface_row = float(np.mean(sy))
+        depth = (uy - surface_row) * self.metres_per_px(image_x, image_y)
+        if self.rope_offset and not self.under_rope:
+            distance = self.swimmer_distance()
+            depth = depth - self.camera_depth * (distance / (distance - self.rope_offset) - 1)
+        return depth
+
+    def _lens_isoline(self, world_x: float, frame_height: int):
+        rulers = self.swimmer_rulers()
+        lo, hi = rulers[0].span
+        grid = np.linspace(lo, hi, 4001)
+        values = np.mean([ruler(grid) for ruler in rulers], axis=0)
+        order = np.argsort(values)
+        if not (values.min() <= world_x <= values.max()):
+            return []
+        column = float(np.interp(world_x, values[order], grid[order]))
+        low, high = self.world_range()
+        interpolated = low <= world_x <= high
+        rows = np.linspace(-0.2 * frame_height, 1.2 * frame_height, 60)
+        xs, ys = self._from_ideal(np.full(rows.shape, column), rows)
+        points = [(float(x), float(y)) for x, y in zip(xs, ys)
+                  if np.isfinite(x) and np.isfinite(y) and 0 <= y <= frame_height - 1]
+        return [(a, b, interpolated) for a, b in zip(points, points[1:])]
+
+
+@dataclass
+class Ruler:
+    """
+    Distance along one straight pool line from ideal-camera image position:
+    X = (p0 + p1 t) / (1 + p2 t) with t = u / 1000 -- exactly how a straight
+    line maps through an ideal camera (p2 is perspective from the camera being
+    turned; ~0 when it's square-on). Fitted to all the line's marks at once.
+    """
+
+    params: Tuple[float, float, float]
+    u: np.ndarray
+    metres: np.ndarray
+    span: Tuple[float, float]
+
+    @classmethod
+    def fit(cls, u, metres, span) -> "Ruler":
+        u, metres = np.asarray(u, dtype=float), np.asarray(metres, dtype=float)
+        t = u / 1000.0
+        linear = np.polyfit(t, metres, 1)
+        params = (float(linear[1]), float(linear[0]), 0.0)
+        if len(u) >= 4:
+            design = np.column_stack([np.ones_like(t), t, -t * metres])
+            p0, p1, p2 = np.linalg.lstsq(design, metres, rcond=None)[0]
+            edges = np.array(span) / 1000.0
+            # keep it only if it's a plausible camera: no pole across the frame
+            # and a perspective term that changes the scale by under 30% there
+            if np.all(np.abs(p2 * edges) < 0.3):
+                params = (float(p0), float(p1), float(p2))
+        return cls(params, u, metres, span)
+
+    def __call__(self, u):
+        t = np.asarray(u, dtype=float) / 1000.0
+        p0, p1, p2 = self.params
+        return (p0 + p1 * t) / (1 + p2 * t)
+
+    def slope(self, u):
+        """dX/du in metres per pixel."""
+        t = np.asarray(u, dtype=float) / 1000.0
+        p0, p1, p2 = self.params
+        return (p1 - p0 * p2) / (1 + p2 * t) ** 2 / 1000.0
+
+    def residuals(self) -> np.ndarray:
+        """Each mark's distance from the fit (m)."""
+        return self.metres - self(self.u)
+
+    def left_out_residuals(self) -> np.ndarray:
+        """Each mark's miss when the fit is made without it: an honest check,
+        and the way a single mis-click shows up."""
+        misses = []
+        for i in range(len(self.u)):
+            keep = np.arange(len(self.u)) != i
+            if keep.sum() < 2:
+                return np.full(len(self.u), np.nan)
+            other = Ruler.fit(self.u[keep], self.metres[keep], self.span)
+            misses.append(float(self.metres[i] - other(self.u[i])))
+        return np.array(misses)
+
+
+def ruler_report(calibration: Calibration, line: ReferenceLine) -> List[str]:
+    """How one line's marks fit the lens model, and any mark that looks mis-clicked."""
+    ruler = calibration.ruler(line)
+    misses = ruler.left_out_residuals()
+    scale = abs(float(ruler.slope(np.mean(ruler.u))))
+    lines = [f"{line.name}: {len(ruler.u)} marks; {1 / scale:.0f} px per metre at this line."]
+    # Leaving one out needs enough marks for the rest to fit the full formula.
+    if len(ruler.u) >= 5 and np.isfinite(misses).all():
+        lines.append(f"  each mark predicted from the others: within {np.abs(misses).max() * 100:.1f} cm "
+                     f"(typically {np.median(np.abs(misses)) * 100:.1f} cm)")
+        typical = np.median(np.abs(misses))
+        for metres, miss in zip(ruler.metres, misses):
+            if abs(miss) > max(3 * typical, 0.05):
+                lines.append(f"  the {metres:g} m mark is {abs(miss) * 100:.0f} cm off the others: "
+                             "probably mis-clicked, or the wrong distance. Re-click it with --edit.")
+    else:
+        fitted = ruler.residuals()
+        lines.append(f"  marks sit within {np.abs(fitted).max() * 100:.1f} cm of the fit; click 5 or more "
+                     "to check each against the others.")
+    return lines
+
+
+def calibration_path(video: str, folder: str = os.path.join("data", "calibrations")) -> str:
+    """Where a clip's calibration lives by default: data/calibrations/<clip>.json."""
+    stem = os.path.splitext(os.path.basename(video))[0]
+    return os.path.join(folder, stem + ".json")
+
+
+def find_calibration(video: Optional[str]) -> Optional[str]:
+    """The clip's calibration file if it has one at the default place."""
+    if not video:
+        return None
+    path = calibration_path(video)
+    return path if os.path.exists(path) else None
 
 
 def coincident_lines(lines: Sequence[ReferenceLine], tolerance: float = 10.0) -> List[Tuple[str, str]]:

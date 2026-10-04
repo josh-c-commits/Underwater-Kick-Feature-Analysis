@@ -243,3 +243,90 @@ def test_summary_peak_speed_is_the_fastest_moment_for_right_to_left_swimmers():
     assert summary["direction"] == "right-to-left"
     assert summary["mean_speed"] == pytest.approx(3.0 * FPS, rel=0.05)
     assert summary["peak_speed"] == pytest.approx(4.0 * FPS, rel=0.08)
+
+
+def test_acceleration_is_reported():
+    """A swimmer speeding up at a constant 300 px/s^2 reads as about that."""
+    from analysis.analysis import kinematics
+
+    fps, frames = 60.0, np.arange(1, 121)
+    t = (frames - 1) / fps
+    boxes = pd.DataFrame({"frame": frames, "found": True,
+                          "centroid_x": 100 + 50 * t + 0.5 * 300 * t ** 2, "centroid_y": 200.0})
+    table = kinematics(boxes, fps)
+    assert np.nanmedian(table["accel_px_s2"].to_numpy()[20:-20]) == pytest.approx(300, rel=0.05)
+
+
+# ---------- filling gaps ----------
+
+from analysis.analysis import kick_frequency  # noqa: E402
+from analysis.association import smooth_track  # noqa: E402
+
+
+def straight_swim(frames=120, step=3.0):
+    f = np.arange(1, frames + 1)
+    return pd.DataFrame({"frame": f, "found": True, "centroid_x": 100 + step * (f - 1),
+                         "centroid_y": 200.0, "box_w": 100.0})
+
+
+def test_smoother_fills_a_gap_on_the_swimmers_path_and_says_how_sure_it_is():
+    x = 100 + 3.0 * np.arange(60)
+    observed = np.ones(60, bool)
+    observed[20:35] = False
+    xs, _, sx, _ = smooth_track(x, np.full(60, 50.0), observed, 60.0, 100.0)
+    assert np.abs(xs[20:35] - x[20:35]).max() < 0.1
+    assert sx[27] > sx[20] > sx[10], "least sure mid-gap"
+
+
+def test_short_gaps_are_filled_for_speed_and_flagged():
+    boxes = straight_swim()
+    boxes.loc[boxes.frame.between(40, 69), ["found", "centroid_x"]] = [False, np.nan]  # 0.5 s
+    table = kinematics(boxes, 60.0)
+    gap = table.frame.between(40, 69)
+    assert table.loc[gap, "filled"].all() and not table.loc[~gap, "filled"].any()
+    assert np.isfinite(table.loc[gap, "speed_px_s"]).all()
+    assert table.loc[gap, "speed_px_s"].to_numpy() == pytest.approx(180.0, rel=0.05)
+
+
+def test_long_gaps_stay_empty():
+    boxes = straight_swim(frames=300)
+    boxes.loc[boxes.frame.between(100, 219), ["found", "centroid_x"]] = [False, np.nan]  # 2 s
+    table = kinematics(boxes, 60.0, fill_seconds=1.0)
+    assert not table.loc[table.frame.between(100, 219), "filled"].any()
+    assert table.loc[table.frame.between(100, 219), "x_smooth"].isna().all()
+
+
+def test_merged_frames_are_replaced_not_trusted():
+    boxes = straight_swim()
+    boxes["merged"] = boxes.frame.between(50, 59)
+    boxes.loc[boxes["merged"], "centroid_x"] += 80  # pulled toward someone else
+    table = kinematics(boxes, 60.0)
+    merged = table.frame.between(50, 59)
+    assert table.loc[merged, "filled"].all()
+    expected = 100 + 3.0 * (table.loc[merged, "frame"] - 1)
+    assert np.abs(table.loc[merged, "x_smooth"] - expected).max() < 2
+
+
+def test_kick_frequency_ignores_filled_frames_and_survives_gaps():
+    fps, n = 60.0, 600
+    t = np.arange(n) / fps
+    keep = np.ones(n, bool)
+    keep[150:220] = keep[400:430] = False
+    y = 20 * np.sin(2 * np.pi * 2.0 * t)
+    assert kick_frequency(t[keep], y[keep]) == pytest.approx(2.0, abs=0.01)
+
+
+def test_calibrated_speed_is_positive_whichever_way_distance_runs():
+    """Distance from the wall grows as the swimmer moves left across the frame:
+    speed in m/s must still come out positive in the direction of travel."""
+    from analysis.analysis import kinematics, summarize
+    from analysis.calibration import Calibration, ReferenceLine
+
+    calibration = Calibration(lines=[ReferenceLine("floor", [(100.0, 50.0, 10.0), (900.0, 50.0, 0.0)])])
+    frames = np.arange(1, 121)
+    boxes = pd.DataFrame({"frame": frames, "found": True, "centroid_x": 800.0 - 4 * frames,
+                          "centroid_y": 50.0, "box_w": 40.0, "box_h": 12.0, "merged": False})
+    summary = summarize(kinematics(boxes, 60.0, calibration), 60.0)
+    assert summary["speed_units"] == "m/s"
+    assert summary["mean_speed"] == pytest.approx(4 * 60 * 10 / 800, rel=0.05)
+    assert summary["direction"] == "right-to-left"

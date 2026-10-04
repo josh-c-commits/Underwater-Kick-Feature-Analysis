@@ -1,0 +1,18 @@
+{
+  "source": "data/raw/josh_back_01.mov",
+  "width": 3840,
+  "height": 2160,
+  "rotation_deg": -1.4090135565894562,
+  "level_line": [
+    [
+      14.0,
+      1844.0
+    ],
+    [
+      3673.0,
+      1754.0
+    ]
+  ],
+  "tone_mapped": "hlg",
+  "ignore_above": 713
+}

@@ -11,7 +11,6 @@ from __future__ import annotations
 import csv
 import os
 import shutil
-import subprocess
 import tempfile
 
 from typing import Optional, Tuple
@@ -23,32 +22,8 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
 from .landmarks import named_header, NUM_LANDMARKS
+from .normalize import normalize_video, read_clip_info
 from .tracking import crop_to_frame_norm, fixed_box
-
-
-def normalize_video(input_path: str, output_path: str) -> None:
-    """
-    Re-encode with ffmpeg so rotation metadata is baked into the pixel
-    data and the codec is one OpenCV decodes reliably. This is what
-    fixes NORM_RECT/IMAGE_DIMENSIONS errors and the intermittent frame
-    corruption that comes from reading .mov/HEVC directly in cv2.
-    """
-    if shutil.which("ffmpeg") is None:
-        raise RuntimeError(
-            "ffmpeg not found on PATH. Install it (e.g. `winget install ffmpeg` "
-            "or download from ffmpeg.org) and make sure it's on PATH."
-        )
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", input_path,
-        "-vf", "format=yuv420p",
-        "-c:v", "libx264",
-        "-an",
-        output_path,
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg normalization failed:\n{result.stderr}")
 
 
 def build_row(
@@ -131,7 +106,8 @@ def extract(
     """
     tmp_dir = None
     try:
-        if normalize:
+        # A clip with a sidecar has already been through normalize-video.
+        if normalize and read_clip_info(input_video) is None:
             tmp_dir = tempfile.mkdtemp(prefix="analysis_")
             video_path = os.path.join(tmp_dir, "normalized_input.mp4")
             normalize_video(input_video, video_path)

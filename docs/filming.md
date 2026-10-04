@@ -11,43 +11,48 @@ How to record footage the pipeline can measure well.
   one that rotates or zooms. Clamp it if you can.
 - **Frame rate.** 60 fps or more. A dolphin kick takes around half a second, so
   60 fps gives about 30 samples per kick.
-- **Start with the swimmer in view.** For now the swimmer can only be selected on
-  frame 1, so trim each clip to start once they are clearly visible.
 - **Keep one format.** Run every clip through `normalize-video` once and use that file
-  for every later step, so frame numbers stay consistent.
+  for every later step, so frame numbers stay consistent. Use `--level` to straighten
+  the frame (click two points far apart on the lane rope), and `--ignore-top 0.33` to
+  leave the water surface out of measurement, as long as the swimmer stays below it
+  until the breakout.
+- **Turn off the phone's video stabilization** once the camera is on a tripod. It shifts
+  and warps each frame slightly, which moves the lens centre around.
 
-## Calibration markers
+## Calibration
 
-Distances come from markers placed at known positions in the swimmer's lane.
+With the 0.5× lens in 4K, the pool's own floor lines are the ruler and no markers are
+needed.
 
-1. **Place them along the lane's centre line on the floor.** That puts them in the
-   same vertical plane as the swimmer. Lane ropes and wall marks sit at different
-   distances from the camera and give the wrong scale.
-2. **Measure distances horizontally from the wall.** Where the floor slopes, a tape
-   laid along it reads long.
-3. **Space them about a metre apart** across the whole distance you want to
-   measure, e.g. 0–15 m. Dense marks correct lens distortion and let the
-   calibration check its own clicks.
-4. **Add a second row at swimmer depth if you can**, e.g. floats tied a fixed height
-   above weights. A single floor row assumes a level, square-on camera; a second
-   row measures any tilt.
-5. **Leave the markers in while swimming, if possible.** Tracking ignores anything
-   that doesn't move, and every clip then carries its own calibration. If they must
-   come out, film them for a few seconds first without touching the camera, then
-   calibrate from just those frames:
+1. **Swim directly above a floor line**, your lane's centre line. Its distance from
+   the camera sets the scale, and the calibration measures it from your clicks on
+   that line. Drifting 30 cm toward or away from the camera costs about 2%.
+2. **Keep a lane rope in view** for depth below the surface: it floats on the surface,
+   so depth is measured down from it. For the most accurate depth, swim directly
+   beneath a rope and calibrate with `--under-rope`.
+3. **Note roughly how deep the phone is** (within 25 cm), in case the rope you click
+   isn't at your lane's distance and you want `--rope-offset` to correct for it.
+4. **Calibrate each clip** unless the camera stayed put between clips:
 
    ```bash
-   uv run python -m analysis calibrate clip.mp4 pool.json --line floor \
-       --mark-range 0 15 1 --seconds 0 5
+   uv run python -m analysis calibrate clip.mp4 --line lane --mark-range 6 69 9 --feet --surface
    ```
 
-   If the camera might have been knocked while removing them, add `--stabilize`
-   here and when tracking, so both use the same corrected coordinates.
+   Click where each floor line crosses the line you swam along, starting from the
+   wall you pushed off from (`s` skips a line that's out of view), then 3–5 points
+   spread along the rope.
+
+**Other footage** (another lens, or 1080p, where the lens model isn't measured) still
+uses markers at known distances along the floor of your lane, about a metre apart.
+If they can't stay in during the swim, film them for a few seconds first and
+calibrate from those frames with `--seconds 0 5` (add `--stabilize` if the camera may
+have been knocked).
 
 ## Checking a calibration
 
-- The report printed after clicking gives the lens bend, the error between marks,
-  and any mark that looks mis-clicked. To fix a single mark without redoing the
-  rest, re-run the same command with `--edit`.
+- The report printed after clicking says how well the marks fit the lens model (each
+  predicted from the others), names any that look mis-clicked, and gives your lane's
+  distance from the camera. To fix a single mark without redoing the rest, re-run
+  the same command with `--edit`.
 - `overlay ... --still` draws the distance lines and your clicked marks onto the
   reference image. Every ring should sit on its marker.

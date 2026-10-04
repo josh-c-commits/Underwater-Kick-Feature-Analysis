@@ -1,0 +1,18 @@
+{
+  "source": "data/raw/josh_front_01.mov",
+  "width": 3840,
+  "height": 2160,
+  "rotation_deg": 0.0,
+  "level_line": [
+    [
+      19.0,
+      2124.0
+    ],
+    [
+      3808.0,
+      2127.0
+    ]
+  ],
+  "tone_mapped": "hlg",
+  "ignore_above": 713
+}
